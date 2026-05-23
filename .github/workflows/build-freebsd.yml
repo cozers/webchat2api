@@ -57,10 +57,18 @@ jobs:
             python3.13 -m venv .venv
             . .venv/bin/activate
             python -m ensurepip --upgrade
-            python -m pip install --upgrade pip setuptools wheel uv
-            export UV_LINK_MODE=copy
-            uv sync --frozen --no-dev
-            uv pip install pyinstaller
+            python -m pip install --upgrade pip setuptools wheel pyinstaller
+            python - <<'PY'
+            import tomllib
+
+            with open("pyproject.toml", "rb") as file:
+                project = tomllib.load(file)["project"]
+
+            with open("requirements-freebsd.txt", "w", encoding="utf-8") as file:
+                file.write("\n".join(project["dependencies"]))
+                file.write("\n")
+            PY
+            python -m pip install -r requirements-freebsd.txt
             pyinstaller \
               --clean \
               --onefile \
