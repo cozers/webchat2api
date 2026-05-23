@@ -8,8 +8,9 @@ from fastapi import HTTPException, Request
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
+from utils.runtime_paths import bundle_root
 
-BASE_DIR = Path(__file__).resolve().parents[1]
+BASE_DIR = bundle_root()
 WEB_DIST_DIR = BASE_DIR / "web_dist"
 
 

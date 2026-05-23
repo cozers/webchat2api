@@ -1,0 +1,75 @@
+name: Build FreeBSD Binary
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  freebsd:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build web assets
+        shell: bash
+        run: |
+          set -euxo pipefail
+          npm --prefix web install
+          NEXT_PUBLIC_APP_VERSION="$(cat VERSION)" npm --prefix web run build
+          rm -rf web_dist
+          cp -R web/out web_dist
+
+      - name: Build FreeBSD binary
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.2"
+          usesh: true
+          sync: rsync
+          prepare: |
+            pkg install -y python313 py313-sqlite3 py313-pip git gcc gmake pkgconf rust openssl postgresql16-client
+          run: |
+            set -eux
+            python3.13 -m venv .venv
+            . .venv/bin/activate
+            python -m pip install --upgrade pip setuptools wheel uv
+            export UV_LINK_MODE=copy
+            uv sync --frozen --no-dev
+            uv pip install pyinstaller
+            pyinstaller \
+              --clean \
+              --onefile \
+              --name webchat2api-freebsd-amd64 \
+              --add-data web_dist:web_dist \
+              --add-data VERSION:. \
+              --hidden-import uvicorn.loops.auto \
+              --hidden-import uvicorn.protocols.http.auto \
+              --hidden-import uvicorn.protocols.websockets.auto \
+              main.py
+            strip dist/webchat2api-freebsd-amd64 || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webchat2api-freebsd-amd64
+          path: dist/webchat2api-freebsd-amd64
+          if-no-files-found: error
+
+      - name: Publish release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/webchat2api-freebsd-amd64
+          fail_on_unmatched_files: true
+          make_latest: true

@@ -8,11 +8,13 @@ from pathlib import Path
 import time
 
 from services.storage.base import StorageBackend
+from utils.runtime_paths import bundle_root, runtime_root
 
-BASE_DIR = Path(__file__).resolve().parents[1]
+BASE_DIR = runtime_root()
+BUNDLE_DIR = bundle_root()
 DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
-VERSION_FILE = BASE_DIR / "VERSION"
+VERSION_FILE = BUNDLE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
 DEFAULT_LOGIN_SECRET = "admin"
 
