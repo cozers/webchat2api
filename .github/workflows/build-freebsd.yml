@@ -51,7 +51,7 @@ jobs:
           usesh: true
           sync: rsync
           prepare: |
-            pkg install -y python313 git gcc gmake pkgconf rust openssl postgresql16-client
+            pkg install -y python313 git gcc gmake pkgconf rust openssl postgresql16-client jpeg-turbo tiff webp lcms2 freetype2 openjpeg
           run: |
             set -eux
             python3.13 -m venv .venv
