@@ -51,11 +51,12 @@ jobs:
           usesh: true
           sync: rsync
           prepare: |
-            pkg install -y python313 py313-pip git gcc gmake pkgconf rust openssl postgresql16-client
+            pkg install -y python313 git gcc gmake pkgconf rust openssl postgresql16-client
           run: |
             set -eux
-            python3 -m venv .venv
+            python3.13 -m venv .venv
             . .venv/bin/activate
+            python -m ensurepip --upgrade
             python -m pip install --upgrade pip setuptools wheel uv
             export UV_LINK_MODE=copy
             uv sync --frozen --no-dev
