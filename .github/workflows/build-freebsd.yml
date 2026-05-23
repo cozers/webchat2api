@@ -64,11 +64,18 @@ jobs:
             with open("pyproject.toml", "rb") as file:
                 project = tomllib.load(file)["project"]
 
+            dependencies = [
+                dependency for dependency in project["dependencies"]
+                if not dependency.lower().startswith("curl-cffi")
+            ]
+            dependencies.append("httpx[socks]>=0.28.1")
+
             with open("requirements-freebsd.txt", "w", encoding="utf-8") as file:
-                file.write("\n".join(project["dependencies"]))
+                file.write("\n".join(dependencies))
                 file.write("\n")
             PY
             python -m pip install -r requirements-freebsd.txt
+            cp -R packaging/freebsd/curl_cffi ./curl_cffi
             pyinstaller \
               --clean \
               --onefile \
