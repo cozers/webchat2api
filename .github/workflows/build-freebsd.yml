@@ -86,7 +86,19 @@ jobs:
               --hidden-import uvicorn.protocols.http.auto \
               --hidden-import uvicorn.protocols.websockets.auto \
               main.py
-            strip dist/webchat2api-freebsd-amd64 || true
+            ls -lh dist/webchat2api-freebsd-amd64
+            file dist/webchat2api-freebsd-amd64
+            size="$(stat -f %z dist/webchat2api-freebsd-amd64)"
+            test "${size}" -gt 10000000
+
+      - name: Validate binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ls -lh dist/webchat2api-freebsd-amd64
+          file dist/webchat2api-freebsd-amd64
+          size="$(stat -c %s dist/webchat2api-freebsd-amd64)"
+          test "${size}" -gt 10000000
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -102,4 +114,5 @@ jobs:
           name: ${{ steps.version.outputs.tag }}
           files: dist/webchat2api-freebsd-amd64
           fail_on_unmatched_files: true
+          overwrite_files: true
           make_latest: true
