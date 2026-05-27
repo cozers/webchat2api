@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+from contextlib import contextmanager
+from unittest.mock import Mock, patch
 from typing import Any
 
 if "sqlalchemy" not in sys.modules:
@@ -46,6 +48,12 @@ if "git" not in sys.modules:
     sys.modules["git"] = git
     sys.modules["git.exc"] = git_exc
 
+if "tiktoken" not in sys.modules:
+    tiktoken = types.ModuleType("tiktoken")
+    tiktoken.encoding_for_model = lambda *args, **kwargs: types.SimpleNamespace(encode=lambda text: [])
+    tiktoken.get_encoding = lambda *args, **kwargs: types.SimpleNamespace(encode=lambda text: [])
+    sys.modules["tiktoken"] = tiktoken
+
 if "fastapi" not in sys.modules:
     fastapi = types.ModuleType("fastapi")
 
@@ -69,9 +77,50 @@ if "fastapi.responses" not in sys.modules:
     fastapi_responses.StreamingResponse = object
     sys.modules["fastapi.responses"] = fastapi_responses
 
+
+class TestGrokConsoleError(RuntimeError):
+    def __init__(self, message: str, status_code: int = 502, upstream_status: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.upstream_status = upstream_status
+
+
+_MISSING = object()
+
+
+@contextmanager
+def patched_grok_validation(return_value: object = None, side_effect: Exception | None = None):
+    module_name = "services.providers.grok"
+    grok_module = types.ModuleType(module_name)
+    validate = Mock(return_value=return_value, side_effect=side_effect)
+    setattr(grok_module, "GrokConsoleError", TestGrokConsoleError)
+    setattr(grok_module, "validate_grok_access_token", validate)
+    previous_module = sys.modules.get(module_name, _MISSING)
+    services_providers = sys.modules.get("services.providers")
+    previous_attr = getattr(services_providers, "grok", _MISSING) if services_providers is not None else _MISSING
+    sys.modules[module_name] = grok_module
+    if services_providers is not None:
+        setattr(services_providers, "grok", grok_module)
+    try:
+        yield validate
+    finally:
+        if previous_module is _MISSING:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous_module
+        if services_providers is not None:
+            if previous_attr is _MISSING:
+                try:
+                    delattr(services_providers, "grok")
+                except AttributeError:
+                    pass
+            else:
+                setattr(services_providers, "grok", previous_attr)
+
+
 from services.account_service import AccountService
 import services.account_service as account_service_module
-from services.models import GROK_PROVIDER, GPT_PROVIDER
+from services.models import GROK_PROVIDER, GPT_PROVIDER, resolve_model
 
 account_service_module.log_service.add = lambda *args, **kwargs: None
 
@@ -118,7 +167,168 @@ class AccountProviderTests(unittest.TestCase):
         self.assertEqual(service.get_text_access_token(provider=GPT_PROVIDER), "gpt-token")
         self.assertEqual(service.get_text_access_token(provider=GROK_PROVIDER), "grok-token")
 
-    def test_image_and_refresh_candidates_ignore_grok_accounts(self) -> None:
+    def test_grok_account_normalizes_simple_sso_cookie_token(self) -> None:
+        service = AccountService(MemoryStorage())
+        service.add_account_items([
+            {"access_token": " sso=grok-token ", "provider": "grok"},
+        ])
+
+        [account] = service.list_accounts()
+        self.assertEqual(account["access_token"], "grok-token")
+        self.assertEqual(service.get_text_access_token(provider=GROK_PROVIDER), "grok-token")
+
+    def test_grok_account_normalizes_case_insensitive_spaced_sso_token(self) -> None:
+        service = AccountService(MemoryStorage())
+        service.add_account_items([
+            {"access_token": " SSO  =  grok-token ", "provider": "grok"},
+        ])
+
+        [account] = service.list_accounts()
+        self.assertEqual(account["access_token"], "grok-token")
+        self.assertEqual(service.get_text_access_token(provider=GROK_PROVIDER), "grok-token")
+
+    def test_grok_account_preserves_spaced_sso_cookie_header_token(self) -> None:
+        cookie_token = " SSO  =  grok-token ; other=value "
+        service = AccountService(MemoryStorage([{"access_token": cookie_token, "provider": "grok"}]))
+
+        [account] = service.list_accounts()
+        self.assertEqual(account["access_token"], "SSO  =  grok-token ; other=value")
+
+    def test_grok_account_preserves_full_cookie_header_token(self) -> None:
+        cookie_token = " sso=grok-token ; other=value "
+        service = AccountService(MemoryStorage([{"access_token": cookie_token, "provider": "grok"}]))
+
+        [account] = service.list_accounts()
+        self.assertEqual(account["access_token"], "sso=grok-token ; other=value")
+
+    def test_grok_account_cloudflare_fields_are_optional_metadata(self) -> None:
+        service = AccountService(MemoryStorage())
+        service.add_account_items([
+            {"access_token": "grok-token", "provider": "grok"},
+        ])
+
+        [account] = service.list_accounts()
+        self.assertEqual(account["access_token"], "grok-token")
+        self.assertEqual(account["cf_cookies"], "")
+        self.assertIsNone(account["user_agent"])
+        self.assertEqual(service.get_text_access_token(provider=GROK_PROVIDER), "grok-token")
+
+    def test_selects_grok_app_chat_token_by_tier_semantics(self) -> None:
+        basic_service = AccountService(MemoryStorage())
+        basic_service.add_account_items([
+            {"access_token": "basic-token", "provider": "grok", "tier": "free"},
+            {"access_token": "super-token", "provider": "grok", "tier": "premium"},
+            {"access_token": "heavy-token", "provider": "grok", "tier": "heavy"},
+        ])
+        super_service = AccountService(MemoryStorage())
+        super_service.add_account_items([
+            {"access_token": "basic-token", "provider": "grok", "tier": "free"},
+            {"access_token": "super-token", "provider": "grok", "tier": "premium"},
+            {"access_token": "heavy-token", "provider": "grok", "tier": "heavy"},
+        ])
+        heavy_service = AccountService(MemoryStorage())
+        heavy_service.add_account_items([
+            {"access_token": "basic-token", "provider": "grok", "tier": "free"},
+            {"access_token": "super-token", "provider": "grok", "tier": "premium"},
+            {"access_token": "heavy-token", "provider": "grok", "tier": "heavy"},
+        ])
+
+        self.assertEqual(basic_service.get_grok_app_chat_access_token(resolve_model("grok-4.20-0309-non-reasoning")), "basic-token")
+        self.assertEqual(super_service.get_grok_app_chat_access_token(resolve_model("grok-4.20-0309")), "super-token")
+        self.assertEqual(heavy_service.get_grok_app_chat_access_token(resolve_model("grok-4.20-0309-heavy")), "heavy-token")
+
+    def test_prefer_best_grok_app_chat_selection_tries_heavy_super_basic(self) -> None:
+        service = AccountService(MemoryStorage())
+        service.add_account_items([
+            {"access_token": "basic-token", "provider": "grok", "tier": "basic", "cf_cookies": "cf_bm=value", "user_agent": "Test UA"},
+            {"access_token": "super-token", "provider": "grok", "tier": "super"},
+        ])
+
+        [account] = [item for item in service.list_accounts() if item["access_token"] == "basic-token"]
+        self.assertEqual(account["cf_cookies"], "cf_bm=value")
+        self.assertEqual(account["user_agent"], "Test UA")
+        self.assertEqual(service.get_grok_app_chat_access_token(resolve_model("grok-4.20-fast")), "super-token")
+
+    def test_grok_app_chat_selection_uses_capabilities_and_status(self) -> None:
+        service = AccountService(MemoryStorage())
+        service.add_account_items([
+            {"access_token": "disabled-heavy", "provider": "grok", "tier": "heavy", "status": "禁用"},
+            {"access_token": "image-heavy", "provider": "grok", "tier": "heavy", "capabilities": ["image"]},
+            {"access_token": "chat-heavy", "provider": "grok", "tier": "heavy", "capabilities": "chat,heavy"},
+        ])
+
+        self.assertEqual(service.get_grok_app_chat_access_token(resolve_model("grok-4.20-heavy")), "chat-heavy")
+
+    def test_grok_app_chat_selection_falls_back_to_provider_round_robin(self) -> None:
+        service = AccountService(MemoryStorage())
+        service.add_account_items([
+            {"access_token": "gpt-token", "provider": "gpt"},
+            {"access_token": "unknown-tier", "provider": "grok", "tier": "enterprise"},
+            {"access_token": "plain-grok", "provider": "grok"},
+        ])
+
+        self.assertEqual(service.get_grok_app_chat_access_token(resolve_model("grok-4.20-0309-heavy")), "unknown-tier")
+        self.assertEqual(service.get_grok_app_chat_access_token(resolve_model("grok-4.20-0309-heavy")), "plain-grok")
+
+    def test_refresh_accounts_attempts_grok_validation(self) -> None:
+        service = AccountService(MemoryStorage())
+        service.add_account_items([
+            {"access_token": "grok-token", "provider": "grok", "status": "正常"},
+        ])
+
+        with patched_grok_validation(return_value={"rateLimits": []}) as validate:
+            refresh_result = service.refresh_accounts(["grok-token"])
+
+        validate.assert_called_once()
+        self.assertEqual(validate.call_args.args[0], "grok-token")
+        self.assertEqual(refresh_result["refreshed"], 1)
+        self.assertEqual(refresh_result["errors"], [])
+        [account] = service.list_accounts()
+        self.assertEqual(account["status"], "正常")
+        self.assertTrue(account["app_chat"])
+
+    def test_refresh_accounts_marks_invalid_grok_validation_abnormal(self) -> None:
+        service = AccountService(MemoryStorage())
+        service.add_account_items([
+            {"access_token": "grok-token", "provider": "grok", "status": "正常"},
+        ])
+
+        previous_auto_remove = account_service_module.config.data.get("auto_remove_invalid_accounts")
+        account_service_module.config.data["auto_remove_invalid_accounts"] = False
+        try:
+            with patched_grok_validation(side_effect=TestGrokConsoleError("auth failed with sso=secret-cookie", 401, 401)):
+                refresh_result = service.refresh_accounts(["grok-token"])
+        finally:
+            if previous_auto_remove is None:
+                account_service_module.config.data.pop("auto_remove_invalid_accounts", None)
+            else:
+                account_service_module.config.data["auto_remove_invalid_accounts"] = previous_auto_remove
+
+        self.assertEqual(refresh_result["refreshed"], 0)
+        self.assertEqual(len(refresh_result["errors"]), 1)
+        self.assertEqual(refresh_result["errors"][0]["error"], "Grok app-chat rate-limit validation failed")
+        self.assertNotIn("secret-cookie", refresh_result["errors"][0]["error"])
+        [account] = service.list_accounts()
+        self.assertEqual(account["status"], "异常")
+        self.assertEqual(account["quota"], 0)
+
+    def test_refresh_accounts_keeps_valid_grok_validation_usable(self) -> None:
+        service = AccountService(MemoryStorage())
+        service.add_account_items([
+            {"access_token": "grok-token", "provider": "grok", "status": "异常"},
+        ])
+
+        with patched_grok_validation(return_value={"rateLimits": [{"remaining": 1}]}) as validate:
+            refresh_result = service.refresh_accounts(["grok-token"])
+
+        validate.assert_called_once()
+        self.assertEqual(refresh_result["refreshed"], 1)
+        self.assertEqual(refresh_result["errors"], [])
+        [account] = service.list_accounts()
+        self.assertEqual(account["status"], "正常")
+        self.assertEqual(service.get_text_access_token(provider=GROK_PROVIDER), "grok-token")
+
+    def test_image_and_refresh_candidates_do_not_use_grok_for_image(self) -> None:
         service = AccountService(MemoryStorage())
         service.add_account_items([
             {"access_token": "grok-token", "provider": "grok", "quota": 5, "status": "限流"},
@@ -127,9 +337,6 @@ class AccountProviderTests(unittest.TestCase):
 
         self.assertEqual(service._list_ready_candidate_tokens(), ["gpt-token"])
         self.assertEqual(service.list_limited_tokens(), [])
-        refresh_result = service.refresh_accounts(["grok-token"])
-        self.assertEqual(refresh_result["refreshed"], 0)
-        self.assertEqual(refresh_result["errors"], [])
 
 
 if __name__ == "__main__":
