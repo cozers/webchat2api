@@ -23,10 +23,13 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish latest upstream release tag
+      - name: Merge latest upstream release tag and publish matching tag
         shell: bash
         run: |
           set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git remote add upstream https://github.com/zqbxdev/webchat2api.git || git remote set-url upstream https://github.com/zqbxdev/webchat2api.git
 
@@ -47,5 +50,48 @@ jobs:
             exit 0
           fi
 
-          git fetch --no-tags --force upstream "refs/tags/${latest_tag}:refs/tags/${latest_tag}"
-          git push origin "refs/tags/${latest_tag}:refs/tags/${latest_tag}"
+          upstream_ref="refs/upstream-tags/${latest_tag}"
+
+          git fetch origin main --tags
+          git fetch --no-tags --force upstream "refs/tags/${latest_tag}:${upstream_ref}"
+
+          git checkout main
+          git pull --ff-only origin main
+
+          merge_status=0
+          git merge --no-commit --no-ff "${upstream_ref}" || merge_status=$?
+
+          workflow_conflicts="$(git diff --name-only --diff-filter=U -- .github/workflows || true)"
+          if [ -n "$workflow_conflicts" ]; then
+            while IFS= read -r path; do
+              if git cat-file -e "HEAD:${path}" 2>/dev/null; then
+                git restore --source=HEAD --staged --worktree -- "$path"
+              else
+                git rm -f -- "$path"
+              fi
+            done <<< "$workflow_conflicts"
+          fi
+
+          # Keep this fork's workflows. Pushing a tag that points at upstream's
+          # workflow changes is rejected by GitHub's default GITHUB_TOKEN.
+          git restore --source=HEAD --staged --worktree .github/workflows || true
+
+          if [ "$merge_status" -ne 0 ]; then
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            if [ -n "$conflicts" ]; then
+              echo "Unresolved conflicts outside .github/workflows:"
+              echo "$conflicts"
+              git merge --abort || true
+              exit 1
+            fi
+          fi
+
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            git commit -m "chore: sync upstream ${latest_tag}"
+          else
+            echo "No content changes after merging ${latest_tag}."
+          fi
+
+          git tag -a "${latest_tag}" -m "Release ${latest_tag}"
+          git push origin main
+          git push origin "${latest_tag}"
