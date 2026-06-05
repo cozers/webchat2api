@@ -78,7 +78,8 @@ if "pydantic" not in sys.modules:
 
 from services.account_service import AccountService
 import services.account_service as account_service_module
-from services.models import GROK_PROVIDER, GPT_PROVIDER
+from services.models import GEMINI_PROVIDER, GROK_PROVIDER, GPT_PROVIDER
+from services.providers import registry as provider_registry
 
 account_service_module.log_service.add = lambda *args, **kwargs: None
 
@@ -132,6 +133,7 @@ class AccountExportTests(unittest.TestCase):
                         "access_token": access_token,
                         "id_token": id_token,
                         "refresh_token": "rt_test",
+                        "source_type": "codex",
                     }
                 ]
             )
@@ -178,20 +180,102 @@ class AccountExportTests(unittest.TestCase):
             MemoryStorage(
                 [
                     {"access_token": "gpt-token", "provider": GPT_PROVIDER, "id_token": "gpt-id", "refresh_token": "gpt-rt"},
-                    {"access_token": "grok-token", "provider": GROK_PROVIDER, "id_token": "grok-id", "refresh_token": "grok-rt"},
+                    {"access_token": "sso=grok-token", "provider": GROK_PROVIDER, "id_token": "grok-id", "refresh_token": "grok-rt"},
+                    {"access_token": "__Secure-1PSID=psid; __Secure-1PSIDTS=psidts", "provider": GEMINI_PROVIDER},
                 ]
             )
         )
 
         gpt_items = service.build_export_items(provider=GPT_PROVIDER)
         grok_items = service.build_export_items(provider=GROK_PROVIDER)
+        gemini_items = service.build_export_items(provider=GEMINI_PROVIDER)
         intersected_items = service.build_export_items(["gpt-token", "grok-token"], provider=GROK_PROVIDER)
 
         self.assertEqual([item["access_token"] for item in gpt_items], ["gpt-token"])
         self.assertEqual([item["access_token"] for item in grok_items], ["grok-token"])
+        self.assertEqual([item["access_token"] for item in gemini_items], ["__Secure-1PSID=psid; __Secure-1PSIDTS=psidts"])
         self.assertEqual([item["access_token"] for item in intersected_items], ["grok-token"])
         self.assertEqual(intersected_items[0]["id_token"], "grok-id")
         self.assertEqual(intersected_items[0]["refresh_token"], "grok-rt")
+
+    def test_build_export_items_with_requested_tokens_searches_all_providers(self) -> None:
+        service = AccountService(
+            MemoryStorage(
+                [
+                    {"access_token": "gpt-token", "provider": GPT_PROVIDER, "id_token": "gpt-id", "refresh_token": "gpt-rt"},
+                    {"access_token": "sso=grok-token", "provider": GROK_PROVIDER, "id_token": "grok-id", "refresh_token": "grok-rt"},
+                    {"access_token": "__Secure-1PSID=psid; __Secure-1PSIDTS=psidts", "provider": GEMINI_PROVIDER},
+                ]
+            )
+        )
+
+        items = service.build_export_items([
+            "gpt-token",
+            "sso=grok-token",
+            "__Secure-1PSID=psid; __Secure-1PSIDTS=psidts",
+        ])
+
+        self.assertEqual([item["access_token"] for item in items], [
+            "gpt-token",
+            "grok-token",
+            "__Secure-1PSID=psid; __Secure-1PSIDTS=psidts",
+        ])
+        self.assertEqual(items[0]["id_token"], "gpt-id")
+        self.assertEqual(items[1]["id_token"], "grok-id")
+
+    def test_build_export_items_filters_duplicate_tokens_by_provider(self) -> None:
+        service = AccountService(
+            MemoryStorage(
+                [
+                    {"access_token": "shared-token", "provider": GPT_PROVIDER, "id_token": "gpt-id", "refresh_token": "gpt-rt"},
+                    {"access_token": "sso=shared-token", "provider": GROK_PROVIDER, "id_token": "grok-id", "refresh_token": "grok-rt"},
+                ]
+            )
+        )
+
+        gpt_items = service.build_export_items(["shared-token"], provider=GPT_PROVIDER)
+        grok_items = service.build_export_items(["shared-token"], provider=GROK_PROVIDER)
+
+        self.assertEqual(len(gpt_items), 1)
+        self.assertEqual(len(grok_items), 1)
+        self.assertEqual(gpt_items[0]["id_token"], "gpt-id")
+        self.assertEqual(grok_items[0]["id_token"], "grok-id")
+
+    def test_build_export_items_by_grok_row_id_returns_raw_sso(self) -> None:
+        service = AccountService(
+            MemoryStorage(
+                [
+                    {"access_token": "sso=grok-row-token", "provider": GROK_PROVIDER, "id_token": "grok-id", "refresh_token": "grok-rt"},
+                ]
+            )
+        )
+        [account] = service.list_accounts(provider=GROK_PROVIDER)
+        row_id = provider_registry.account_strategy(GROK_PROVIDER).sanitize_account(account)["row_id"]
+
+        items = service.build_export_items(provider=GROK_PROVIDER, identifiers=[{"row_id": row_id}])
+
+        self.assertEqual([item["access_token"] for item in items], ["grok-row-token"])
+        self.assertEqual(items[0]["id_token"], "grok-id")
+        self.assertEqual(items[0]["refresh_token"], "grok-rt")
+
+    def test_build_export_items_by_gemini_row_id_returns_secret_only_in_export(self) -> None:
+        service = AccountService(
+            MemoryStorage(
+                [
+                    {"access_token": "__Secure-1PSID=psid; __Secure-1PSIDTS=psidts", "provider": GEMINI_PROVIDER, "account_id": "gemini-a"},
+                    {"access_token": "__Secure-1PSID=other-psid; __Secure-1PSIDTS=other-psidts", "provider": GEMINI_PROVIDER, "account_id": "gemini-b"},
+                ]
+            )
+        )
+        [target, _other] = service.list_accounts(provider=GEMINI_PROVIDER)
+        sanitized = provider_registry.account_strategy(GEMINI_PROVIDER).sanitize_account(target)
+        self.assertNotIn("access_token", sanitized)
+        self.assertTrue(sanitized["row_id"])
+
+        items = service.build_export_items(provider=GEMINI_PROVIDER, identifiers=[{"row_id": sanitized["row_id"]}])
+
+        self.assertEqual([item["access_token"] for item in items], ["__Secure-1PSID=psid; __Secure-1PSIDTS=psidts"])
+        self.assertEqual(items[0]["account_id"], "gemini-a")
 
     def test_account_txt_content_is_line_oriented_and_keeps_tokens(self) -> None:
         content = AccountService.build_export_text(
@@ -225,6 +309,7 @@ class AccountExportTests(unittest.TestCase):
         cpa_stub.cpa_import_service = object()
         cpa_stub.list_remote_files = lambda *args, **kwargs: []
         remote_account_stub = types.ModuleType("services.remote_account_service")
+        remote_account_stub.REMOTE_ACCOUNT_SYNC_FAILED = "failed"
         remote_account_stub.remote_account_config = object()
         remote_account_stub.remote_account_import_service = object()
         sub2api_stub = types.ModuleType("services.sub2api_service")
@@ -247,15 +332,18 @@ class AccountExportTests(unittest.TestCase):
 
         self.assertEqual(accounts_api._export_filename("gpt"), "webchat2api-gpt.txt")
         self.assertEqual(accounts_api._export_filename("grok"), "webchat2api_grok.txt")
+        self.assertEqual(accounts_api._export_filename("gemini"), "webchat2api_gemini.txt")
+        with self.assertRaises(ValueError):
+            accounts_api._account_strategy("mystery")
 
     def test_delete_limited_accounts_removes_exact_limited_status(self) -> None:
         service = AccountService(
             MemoryStorage(
                 [
                     {"access_token": "limited_gpt", "provider": "gpt", "status": "限流"},
-                    {"access_token": "limited_grok", "provider": "grok", "status": "限流"},
+                    {"access_token": "sso=limited_grok", "provider": "grok", "status": "限流"},
                     {"access_token": "normal", "provider": "gpt", "status": "正常"},
-                    {"access_token": "disabled", "provider": "grok", "status": "禁用"},
+                    {"access_token": "sso=disabled", "provider": "grok", "status": "禁用"},
                 ]
             )
         )

@@ -1,0 +1,505 @@
+from __future__ import annotations
+
+import base64
+import json
+import sys
+import time
+import unittest
+from typing import Any, cast
+from unittest import mock
+
+from test.optional_stubs import install_curl_cffi_stub, install_fastapi_stubs, install_pil_stub, install_pybase64_stub, install_pydantic_stub, install_starlette_stub, install_tiktoken_stub
+
+install_curl_cffi_stub()
+install_fastapi_stubs()
+install_pil_stub()
+install_pybase64_stub()
+install_pydantic_stub()
+install_starlette_stub()
+install_tiktoken_stub()
+
+FastAPI = cast(Any, getattr(sys.modules["fastapi"], "FastAPI"))
+TestClient = cast(Any, getattr(sys.modules["fastapi.testclient"], "TestClient"))
+HTTPException = cast(type[Exception], getattr(sys.modules["fastapi"], "HTTPException"))
+
+from api import gemini as gemini_api
+from services import gemini_deep_research
+from services.providers import gemini as gemini_provider
+from services.providers.gemini import models as gemini_models
+from services.protocol import gemini_native, openai_v1_chat_complete, openai_v1_complete, openai_v1_response
+
+AUTH_HEADERS = {"Authorization": "Bearer webchat2api"}
+
+
+def _native_body(text: str = "Hello") -> dict[str, Any]:
+    return {"contents": [{"role": "user", "parts": [{"text": text}]}]}
+
+
+def _tool() -> dict[str, Any]:
+    return {
+        "functionDeclarations": [{
+            "name": "get_weather",
+            "description": "Get weather.",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        }]
+    }
+
+
+class GeminiNativeProtocolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        gemini_models.clear_gemini_dynamic_model_cache()
+
+    def tearDown(self) -> None:
+        gemini_models.clear_gemini_dynamic_model_cache()
+
+    def test_models_response_uses_native_shape(self) -> None:
+        response = gemini_native.list_models()
+
+        first = response["models"][0]
+        self.assertTrue(first["name"].startswith("models/gemini-"))
+        self.assertEqual(first["displayName"], first["name"].removeprefix("models/"))
+        self.assertEqual(first["supportedGenerationMethods"], ["generateContent", "streamGenerateContent"])
+
+    def test_models_response_includes_dynamic_discovered_models(self) -> None:
+        with mock.patch("services.providers.gemini.client.fetch_authenticated_init_body", return_value="gemini-2.5-pro gemini-2.5-ultra"):
+            response = gemini_native.list_models()
+
+        models = {item["name"]: item for item in response["models"]}
+        self.assertEqual(models["models/gemini-2.5-ultra"]["displayName"], "gemini-2.5-ultra")
+        self.assertEqual(models["models/gemini-2.5-ultra"]["supportedGenerationMethods"], ["generateContent", "streamGenerateContent"])
+
+    def test_generate_content_text_response(self) -> None:
+        response = gemini_native.generate_content(
+            "models/gemini-2.5-pro",
+            _native_body("Say hi") | {"generationConfig": {"temperature": 0.2, "topP": 0.9, "maxOutputTokens": 32}},
+            completion_func=lambda body, spec, messages: gemini_provider.GeminiCompletion("Hi there"),
+        )
+
+        candidate = response["candidates"][0]
+        self.assertEqual(candidate["content"]["role"], "model")
+        self.assertEqual(candidate["content"]["parts"], [{"text": "Hi there"}])
+        self.assertEqual(candidate["finishReason"], "STOP")
+        self.assertEqual(response["usageMetadata"]["totalTokenCount"], 0)
+
+    def test_generate_content_native_function_call(self) -> None:
+        body = _native_body("weather") | {
+            "tools": [_tool()],
+            "toolConfig": {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["get_weather"]}},
+        }
+        response = gemini_native.generate_content(
+            "gemini-2.5-pro",
+            body,
+            completion_func=lambda body, spec, messages: gemini_provider.GeminiCompletion('```json\n{"status":"call","tool_calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}\n```'),
+        )
+
+        part = response["candidates"][0]["content"]["parts"][0]
+        self.assertEqual(part["functionCall"]["name"], "get_weather")
+        self.assertEqual(part["functionCall"]["args"], {"city": "Paris"})
+
+    def test_generate_content_accepts_function_response_only_turn(self) -> None:
+        body = {"contents": [{"role": "function", "parts": [{"functionResponse": {"name": "get_weather", "response": {"temp": "20C"}}}]}]}
+        response = gemini_native.generate_content(
+            "gemini-2.5-pro",
+            body,
+            completion_func=lambda body, spec, messages: gemini_provider.GeminiCompletion("Thanks"),
+        )
+
+        self.assertEqual(response["candidates"][0]["content"]["parts"], [{"text": "Thanks"}])
+
+    def test_stream_generate_content_sse_chunks_and_stop(self) -> None:
+        with mock.patch.object(gemini_provider, "synthetic_stream_content", return_value=iter(["Hel", "lo"])):
+            chunks = list(gemini_native.stream_generate_content(
+                "gemini-2.5-pro",
+                _native_body("Hi"),
+                completion_func=lambda body, spec, messages: gemini_provider.GeminiCompletion("Hello"),
+            ))
+
+        self.assertEqual(chunks[0]["candidates"][0]["content"]["parts"], [{"text": "Hel"}])
+        self.assertEqual(chunks[1]["candidates"][0]["content"]["parts"], [{"text": "lo"}])
+        self.assertEqual(chunks[-1]["candidates"][0]["finishReason"], "STOP")
+
+    def test_stream_generate_content_skips_empty_text_chunk(self) -> None:
+        with mock.patch.object(gemini_provider, "synthetic_stream_content", return_value=iter([""])):
+            chunks = list(gemini_native.stream_generate_content(
+                "gemini-2.5-pro",
+                _native_body("Hi"),
+                completion_func=lambda body, spec, messages: gemini_provider.GeminiCompletion(""),
+            ))
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["candidates"][0]["content"]["parts"], [])
+        self.assertEqual(chunks[0]["candidates"][0]["finishReason"], "STOP")
+
+    def test_inline_media_without_text_is_preserved(self) -> None:
+        seen_messages: list[dict[str, Any]] = []
+
+        response = gemini_native.generate_content(
+            "gemini-2.5-pro",
+            {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": "AA=="}}]}]},
+            completion_func=lambda body, spec, messages: seen_messages.extend(messages) or gemini_provider.GeminiCompletion("described"),
+        )
+
+        self.assertEqual(response["candidates"][0]["content"]["parts"], [{"text": "described"}])
+        self.assertEqual(seen_messages, [{
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}],
+        }])
+        self.assertEqual(gemini_native.request_text_from_body({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": "AA=="}}]}]}), "[image:image/png]")
+
+    def test_inline_media_with_text_is_preserved(self) -> None:
+        seen_messages: list[dict[str, Any]] = []
+        body = {"contents": [{"role": "user", "parts": [
+            {"text": "Describe this"},
+            {"inline_data": {"mime_type": "image/jpeg", "data": "AQI="}},
+        ]}]}
+
+        gemini_native.generate_content(
+            "gemini-2.5-pro",
+            body,
+            completion_func=lambda body, spec, messages: seen_messages.extend(messages) or gemini_provider.GeminiCompletion("ok"),
+        )
+
+        self.assertEqual(seen_messages, [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AQI="}},
+            ],
+        }])
+        self.assertEqual(gemini_native.request_text_from_body(body), "Describe this")
+
+    def test_responses_gemini_input_image_is_preserved_until_provider_error(self) -> None:
+        with self.assertRaises(HTTPException) as raised:
+            openai_v1_response.handle({
+                "model": "gemini-2.5-pro",
+                "input": [
+                    {"type": "input_text", "text": "Describe this"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+                ],
+            })
+
+        detail = cast(dict[str, Any], getattr(raised.exception, "detail"))
+        self.assertEqual(getattr(raised.exception, "status_code"), 400)
+        self.assertEqual(detail["error"], "Gemini Web image input is not supported by this upstream adapter")
+
+
+    def test_inline_media_rejects_invalid_or_oversized_data(self) -> None:
+        invalid_cases = [
+            ({"mimeType": "text/plain", "data": "AA=="}, "unsupported inline media mime type"),
+            ({"mimeType": "image/png", "data": "not-base64"}, "invalid inline media data"),
+            ({"mimeType": "image/png", "data": ""}, "Gemini generateContent requires at least one text part"),
+        ]
+        for inline, message in invalid_cases:
+            with self.subTest(message=message):
+                with self.assertRaises(HTTPException) as raised:
+                    gemini_native.generate_content(
+                        "gemini-2.5-pro",
+                        {"contents": [{"role": "user", "parts": [{"inlineData": inline}]}]},
+                        completion_func=lambda body, spec, messages: gemini_provider.GeminiCompletion("ignored"),
+                    )
+                self.assertIn(message, str(getattr(raised.exception, "detail")))
+
+        oversized = base64.b64encode(b"0" * (10 * 1024 * 1024 + 1)).decode("ascii")
+        with self.assertRaises(HTTPException) as raised:
+            gemini_native.generate_content(
+                "gemini-2.5-pro",
+                {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": oversized}}]}]},
+                completion_func=lambda body, spec, messages: gemini_provider.GeminiCompletion("ignored"),
+            )
+        self.assertIn("inline media is too large", str(getattr(raised.exception, "detail")))
+
+    def test_native_tool_text_status_returns_content_text(self) -> None:
+        body = _native_body("weather") | {"tools": [_tool()]}
+        response = gemini_native.generate_content(
+            "gemini-2.5-pro",
+            body,
+            completion_func=lambda body, spec, messages: gemini_provider.GeminiCompletion('{"status":"text","content":"No tool needed"}'),
+        )
+
+        self.assertEqual(response["candidates"][0]["content"]["parts"], [{"text": "No tool needed"}])
+
+    def test_deepresearch_options_are_included_in_prompts(self) -> None:
+        prompts: list[str] = []
+        outputs = iter([
+            '{"questions":["What is A?"]}',
+            '{"summary":"A facts","sources":[]}',
+            '{"summary":"Final report"}',
+        ])
+
+        result = gemini_deep_research.run_deep_research(
+            {"query": "A", "language": "fr", "max_sources": 2},
+            completion_func=lambda model, prompt: prompts.append(prompt) or next(outputs),
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(any("fr" in prompt for prompt in prompts))
+        self.assertTrue(any("2" in prompt for prompt in prompts))
+
+
+class GeminiDeepResearchTests(unittest.TestCase):
+    def test_deepresearch_sync(self) -> None:
+        outputs = iter([
+            '{"questions":["What is A?"]}',
+            '{"summary":"A facts","sources":[{"url":"https://example.test/a","title":"A"}]}',
+            '{"summary":"Final report"}',
+        ])
+
+        result = gemini_deep_research.run_deep_research({"query": "A"}, completion_func=lambda model, prompt: next(outputs))
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["summary"], "Final report")
+        self.assertEqual(result["sources"][0]["url"], "https://example.test/a")
+        self.assertGreaterEqual(result["duration_ms"], 0)
+
+    def test_deepresearch_stream_events(self) -> None:
+        outputs = iter([
+            '{"questions":["What is A?"]}',
+            '{"summary":"A facts","sources":["https://example.test/a"]}',
+            '{"summary":"Final report"}',
+        ])
+
+        events = list(gemini_deep_research.stream_deep_research({"query": "A"}, completion_func=lambda model, prompt: next(outputs)))
+        names = [name for name, _ in events]
+
+        self.assertEqual(names[0], "progress")
+        self.assertIn("step", names)
+        self.assertIn("source", names)
+        self.assertIn("result", names)
+        self.assertEqual(names[-1], "done")
+
+    def test_interactions_create_and_poll(self) -> None:
+        outputs = iter([
+            '{"questions":["What is A?"]}',
+            '{"summary":"A facts","sources":[]}',
+            '{"summary":"Final report"}',
+        ])
+        store = gemini_deep_research.InteractionStore(ttl_seconds=60)
+        task = store.create({"query": "A"}, completion_func=lambda model, prompt: next(outputs), owner_id="owner-a")
+
+        deadline = time.time() + 2
+        current = store.get(task["id"], "owner-a")
+        while current and current["status"] == "in_progress" and time.time() < deadline:
+            time.sleep(0.01)
+            current = store.get(task["id"], "owner-a")
+
+        self.assertNotIn("owner_id", task)
+        self.assertIsNone(store.get(task["id"], "owner-b"))
+        self.assertIsNotNone(current)
+        self.assertEqual(cast(dict[str, Any], current)["status"], "completed")
+        self.assertEqual(cast(dict[str, Any], current)["result"]["summary"], "Final report")
+
+
+class GeminiNativeRouteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        app = FastAPI()
+        app.include_router(gemini_api.create_router())
+        self.client = TestClient(app)
+
+    def test_route_registration_in_app_factory(self) -> None:
+        app = FastAPI()
+        app.include_router(gemini_api.create_router())
+        routes = app.routes
+        self.assertIn(("GET", "/gemini/v1beta/models"), routes)
+        self.assertIn(("POST", "/gemini/v1beta/models/{model}:generateContent"), routes)
+        self.assertIn(("POST", "/gemini/v1beta/interactions"), routes)
+
+    def test_models_route_requires_bearer_auth(self) -> None:
+        response = self.client.get("/gemini/v1beta/models", headers={"x-api-key": "webchat2api"})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_models_route_accepts_bearer_auth(self) -> None:
+        response = self.client.get("/gemini/v1beta/models", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 200)
+        payload = cast(dict[str, Any], response.json())
+        self.assertIn("models", payload)
+
+    def test_interactions_create_returns_accepted_task(self) -> None:
+        with mock.patch.object(gemini_api.interaction_store, "create", return_value={"id": "int_test", "status": "in_progress", "query": "A"}):
+            response = self.client.post(
+                "/gemini/v1beta/interactions",
+                headers=AUTH_HEADERS,
+                json={"input": "A"},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        payload = cast(dict[str, Any], response.json())
+        self.assertEqual(payload["id"], "int_test")
+        self.assertEqual(payload["status"], "in_progress")
+
+    def test_generate_content_route_registered(self) -> None:
+        routes = self.client.app.routes
+        self.assertIn(("POST", "/gemini/v1beta/models/{model}:generateContent"), routes)
+
+
+    def test_all_static_gemini_models_route_through_openai_chat_provider(self) -> None:
+        for spec in gemini_models.GEMINI_MODEL_SPECS:
+            with self.subTest(model=spec.id), \
+                 mock.patch.object(gemini_provider, "chat_completion", return_value=gemini_provider.GeminiCompletion(f"ok {spec.id}")) as chat_completion:
+                response = cast(dict[str, Any], openai_v1_chat_complete.handle({
+                    "model": spec.id,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                }))
+
+            called_body, called_spec, called_messages = chat_completion.call_args.args
+            self.assertEqual(called_body["model"], spec.id)
+            self.assertEqual(called_spec.provider, "gemini")
+            self.assertEqual(called_spec.id, spec.id)
+            self.assertEqual(called_messages, [{"role": "user", "content": "Hello"}])
+            self.assertEqual(response["model"], spec.id)
+            self.assertEqual(response["choices"][0]["message"]["content"], f"ok {spec.id}")
+
+    def test_unknown_discoverable_gemini_model_routes_through_openai_chat_provider(self) -> None:
+        with mock.patch.object(gemini_provider, "chat_completion", return_value=gemini_provider.GeminiCompletion("dynamic ok")) as chat_completion:
+            response = cast(dict[str, Any], openai_v1_chat_complete.handle({
+                "model": "gemini-2.5-ultra",
+                "messages": [{"role": "user", "content": "Hello"}],
+            }))
+
+        called_spec = chat_completion.call_args.args[1]
+        self.assertEqual(called_spec.provider, "gemini")
+        self.assertEqual(called_spec.id, "gemini-2.5-ultra")
+        self.assertEqual(called_spec.upstream_model, "gemini-2.5-ultra")
+        self.assertEqual(response["model"], "gemini-2.5-ultra")
+        self.assertEqual(response["choices"][0]["message"]["content"], "dynamic ok")
+
+    def test_all_static_gemini_models_route_through_openai_completions_provider(self) -> None:
+        for spec in gemini_models.GEMINI_MODEL_SPECS:
+            with self.subTest(model=spec.id), \
+                 mock.patch.object(gemini_provider, "chat_completion", return_value=gemini_provider.GeminiCompletion(f"complete {spec.id}")) as chat_completion:
+                response = cast(dict[str, Any], openai_v1_complete.handle({
+                    "model": spec.id,
+                    "prompt": "Hello",
+                }))
+
+            called_body, called_spec, called_messages = chat_completion.call_args.args
+            self.assertEqual(called_body["model"], spec.id)
+            self.assertEqual(called_spec.provider, "gemini")
+            self.assertEqual(called_spec.id, spec.id)
+            self.assertEqual(called_messages, [{"role": "user", "content": "Hello"}])
+            self.assertEqual(response["object"], "text_completion")
+            self.assertEqual(response["model"], spec.id)
+            self.assertEqual(response["choices"][0]["text"], f"complete {spec.id}")
+
+    def test_unknown_discoverable_gemini_model_routes_through_openai_completions_provider(self) -> None:
+        with mock.patch.object(gemini_provider, "chat_completion", return_value=gemini_provider.GeminiCompletion("dynamic completion")) as chat_completion:
+            response = cast(dict[str, Any], openai_v1_complete.handle({
+                "model": "gemini-2.5-ultra",
+                "prompt": "Hello",
+            }))
+
+        called_spec = chat_completion.call_args.args[1]
+        self.assertEqual(called_spec.provider, "gemini")
+        self.assertEqual(called_spec.id, "gemini-2.5-ultra")
+        self.assertEqual(response["model"], "gemini-2.5-ultra")
+        self.assertEqual(response["choices"][0]["text"], "dynamic completion")
+
+    def test_all_static_gemini_models_route_through_native_provider(self) -> None:
+        for spec in gemini_models.GEMINI_MODEL_SPECS:
+            with self.subTest(model=spec.id):
+                seen: dict[str, Any] = {}
+
+                def completion_func(body: dict[str, Any], called_spec, messages: list[dict[str, Any]]) -> gemini_provider.GeminiCompletion:
+                    seen["body"] = body
+                    seen["spec"] = called_spec
+                    seen["messages"] = messages
+                    return gemini_provider.GeminiCompletion(f"native {spec.id}")
+
+                response = gemini_native.generate_content(
+                    f"models/{spec.id}",
+                    _native_body("Hello"),
+                    completion_func=completion_func,
+                )
+
+            self.assertEqual(seen["body"]["model"], spec.id)
+            self.assertEqual(seen["spec"].provider, "gemini")
+            self.assertEqual(seen["spec"].id, spec.id)
+            self.assertEqual(seen["messages"], [{"role": "user", "content": "Hello"}])
+            self.assertEqual(response["modelVersion"], spec.id)
+            self.assertEqual(response["candidates"][0]["content"]["parts"], [{"text": f"native {spec.id}"}])
+
+    def test_unknown_discoverable_gemini_model_routes_through_native_provider(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def completion_func(body: dict[str, Any], spec, messages: list[dict[str, Any]]) -> gemini_provider.GeminiCompletion:
+            seen["body"] = body
+            seen["spec"] = spec
+            seen["messages"] = messages
+            return gemini_provider.GeminiCompletion("native dynamic")
+
+        response = gemini_native.generate_content(
+            "models/gemini-2.5-ultra",
+            _native_body("Hello"),
+            completion_func=completion_func,
+        )
+
+        self.assertEqual(seen["body"]["model"], "gemini-2.5-ultra")
+        self.assertEqual(seen["spec"].provider, "gemini")
+        self.assertEqual(seen["spec"].id, "gemini-2.5-ultra")
+        self.assertEqual(response["modelVersion"], "gemini-2.5-ultra")
+        self.assertEqual(response["candidates"][0]["content"]["parts"], [{"text": "native dynamic"}])
+
+    def test_static_and_dynamic_gemini_models_without_account_return_no_gemini_account(self) -> None:
+        account_service = mock.Mock()
+        account_service.get_text_access_token.return_value = ""
+        for model_id in [*(spec.id for spec in gemini_models.GEMINI_MODEL_SPECS), "gemini-2.5-ultra"]:
+            with self.subTest(model=model_id), \
+                 mock.patch.dict(sys.modules, {"services.account_service": mock.Mock(account_service=account_service)}), \
+                 self.assertRaises(HTTPException) as raised:
+                openai_v1_chat_complete.handle({
+                    "model": model_id,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                })
+
+            self.assertEqual(getattr(raised.exception, "status_code"), 503)
+            self.assertEqual(getattr(raised.exception, "detail"), {"error": "no available Gemini account"})
+
+
+class OpenAIGeminiToolChoiceTests(unittest.TestCase):
+    def test_gemini_required_tool_choice_does_not_fabricate_empty_call(self) -> None:
+        with mock.patch.object(gemini_provider, "chat_completion", return_value=gemini_provider.GeminiCompletion("plain text")):
+            response = cast(dict[str, Any], openai_v1_chat_complete.handle({
+                "model": "gemini-2.5-pro",
+                "messages": [{"role": "user", "content": "weather"}],
+                "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}],
+                "tool_choice": "required",
+            }))
+
+        message = response["choices"][0]["message"]
+        self.assertEqual(response["choices"][0]["finish_reason"], "stop")
+        self.assertNotIn("tool_calls", message)
+        self.assertEqual(message["content"], "plain text")
+
+    def test_gemini_forced_tool_choice_honors_name(self) -> None:
+        with mock.patch.object(gemini_provider, "chat_completion", return_value=gemini_provider.GeminiCompletion('{"status":"call","tool_calls":[{"name":"other","arguments":{}},{"name":"get_weather","arguments":{"city":"Rome"}}]}')):
+            response = cast(dict[str, Any], openai_v1_chat_complete.handle({
+                "model": "gemini-2.5-pro",
+                "messages": [{"role": "user", "content": "weather"}],
+                "tools": [
+                    {"type": "function", "function": {"name": "other", "parameters": {}}},
+                    {"type": "function", "function": {"name": "get_weather", "parameters": {}}},
+                ],
+                "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+            }))
+
+        call = response["choices"][0]["message"]["tool_calls"][0]
+        self.assertEqual(call["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(call["function"]["arguments"]), {"city": "Rome"})
+
+    def test_gemini_tool_choice_none_returns_text(self) -> None:
+        with mock.patch.object(gemini_provider, "chat_completion", return_value=gemini_provider.GeminiCompletion('{"status":"call","tool_calls":[{"name":"get_weather","arguments":{}}]}')):
+            response = cast(dict[str, Any], openai_v1_chat_complete.handle({
+                "model": "gemini-2.5-pro",
+                "messages": [{"role": "user", "content": "weather"}],
+                "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}],
+                "tool_choice": "none",
+            }))
+
+        message = response["choices"][0]["message"]
+        self.assertNotIn("tool_calls", message)
+        self.assertIn("tool_calls", message["content"])
+
+
+if __name__ == "__main__":
+    unittest.main()

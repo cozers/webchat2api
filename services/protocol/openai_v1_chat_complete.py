@@ -6,24 +6,43 @@ from typing import Any, Iterable, Iterator, cast
 
 from fastapi import HTTPException
 
-from services.models import GROK_PROVIDER, resolve_model, is_grok_app_chat_model
-from services.providers import grok
+from services.providers.base import ConversationRequest, GEMINI_PROVIDER, GROK_PROVIDER, ImageGenerationError, ImageOutput
+from services.providers.registry import chat_adapter, image_adapter, image_generation_outputs, resolve_model
 from services.config import config
 import services.protocol.tool_calls as tool_calls
+from services.protocol.chat_completion_cache import (
+    cache_key,
+    chat_completion_cache,
+    is_cacheable_text_request,
+    normalize_text_messages,
+)
 from services.protocol.conversation import (
-    ConversationRequest,
-    ImageOutput,
     collect_image_outputs,
     collect_text,
     count_message_tokens,
     count_text_tokens,
     encode_images,
     normalize_messages,
-    stream_image_outputs_with_pool,
     stream_text_deltas,
     text_backend,
 )
-from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request, parse_image_count
+from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, has_image_message_content, is_image_chat_request, parse_image_count
+
+
+gpt_chat = chat_adapter("gpt")
+grok_chat = chat_adapter("grok")
+gemini_chat = chat_adapter("gemini")
+
+
+def is_grok_app_chat_model(spec: Any) -> bool:
+    return grok_chat.is_app_chat_model(spec)
+
+
+def _unsupported_image_error(provider: str) -> HTTPException:
+    adapter = image_adapter(provider)
+    if hasattr(adapter, "unsupported_image_error"):
+        return adapter.unsupported_image_error()
+    return HTTPException(status_code=400, detail={"error": f"{provider} image chat is unsupported"})
 
 
 def completion_chunk(model: str, delta: dict[str, Any], finish_reason: str | None = None, completion_id: str = "", created: int | None = None) -> dict[str, Any]:
@@ -139,15 +158,25 @@ def stream_text_chat_completion(
     created = int(time.time())
     sent_role = False
     content_parts: list[str] = []
-    request = ConversationRequest(model=model, messages=messages)
-    for delta_text in stream_text_deltas(backend, request):
-        content_parts.append(delta_text)
-        if not sent_role:
-            sent_role = True
-            chunk = completion_chunk(model, {"role": "assistant", "content": delta_text}, None, completion_id, created)
-        else:
-            chunk = completion_chunk(model, {"content": delta_text}, None, completion_id, created)
-        yield stream_chunk(chunk, include_usage)
+    if stream_text_deltas is not gpt_chat.stream_text_deltas:
+        request = ConversationRequest(model=model, messages=messages)
+        for delta_text in stream_text_deltas(backend, request):
+            content_parts.append(delta_text)
+            if not sent_role:
+                sent_role = True
+                chunk = completion_chunk(model, {"role": "assistant", "content": delta_text}, None, completion_id, created)
+            else:
+                chunk = completion_chunk(model, {"content": delta_text}, None, completion_id, created)
+            yield stream_chunk(chunk, include_usage)
+    else:
+        for delta_text in gpt_chat.chat_completion_deltas(body={}, messages=messages, model=model, backend=backend):
+            content_parts.append(delta_text)
+            if not sent_role:
+                sent_role = True
+                chunk = completion_chunk(model, {"role": "assistant", "content": delta_text}, None, completion_id, created)
+            else:
+                chunk = completion_chunk(model, {"content": delta_text}, None, completion_id, created)
+            yield stream_chunk(chunk, include_usage)
     if not sent_role:
         chunk = completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
         yield stream_chunk(chunk, include_usage)
@@ -170,10 +199,11 @@ def stream_tool_chat_completion_from_text(
     created: int | None = None,
     include_usage: bool = False,
     reasoning_content: str = "",
+    gemini_native_tools: bool = False,
 ) -> Iterator[dict[str, Any]]:
     completion_id = completion_id or f"chatcmpl-{uuid.uuid4().hex}"
     created = created or int(time.time())
-    parsed = tool_calls.parse_tool_calls(content, tool_calls.tool_names(body.get("tools")))
+    parsed = tool_calls.parse_gemini_openai_tool_response(content, body) if gemini_native_tools else tool_calls.parse_tool_calls(content, tool_calls.tool_names(body.get("tools")))
     if parsed.calls:
         yield stream_chunk(completion_chunk(model, {"role": "assistant", "content": None}, None, completion_id, created), include_usage)
         for index, call in enumerate(parsed.calls):
@@ -220,7 +250,12 @@ def stream_tool_text_chat_completion(
     include_usage: bool = False,
 ) -> Iterator[dict[str, Any]]:
     request = ConversationRequest(model=model, messages=messages)
-    content = "".join(stream_text_deltas(backend, request))
+    if stream_text_deltas is not gpt_chat.stream_text_deltas:
+        content = "".join(stream_text_deltas(backend, request))
+    elif collect_text is not gpt_chat.collect_text:
+        content = collect_text(backend, request)
+    else:
+        content = gpt_chat.chat_completion(body, messages, model, backend=backend)
     yield from stream_tool_chat_completion_from_text(content, body, model, messages, include_usage=include_usage)
 
 
@@ -232,11 +267,11 @@ def stream_grok_app_chat_completion(body: dict[str, Any], spec, messages: list[d
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     search_sources: list[dict[str, str]] = []
-    for event in grok.app_chat_completion_events(body, spec, messages):
-        search_sources.extend(grok.extract_app_chat_search_sources(event))
-        token, thinking = grok.extract_app_chat_token(event)
+    for event in grok_chat.chat_completion_events(body, spec, messages):
+        search_sources.extend(grok_chat.extract_app_chat_search_sources(event))
+        token, thinking = grok_chat.extract_app_chat_token(event)
         if not token:
-            if grok.is_app_chat_final_event(event):
+            if grok_chat.is_app_chat_final_event(event):
                 break
             continue
         if thinking:
@@ -261,7 +296,7 @@ def stream_grok_app_chat_completion(body: dict[str, Any], spec, messages: list[d
         chunk = completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
         yield stream_chunk(chunk, include_usage)
     final_delta: dict[str, Any] = {}
-    deduped_sources = grok.dedupe_search_sources(search_sources)
+    deduped_sources = grok_chat.dedupe_search_sources(search_sources)
     if deduped_sources:
         final_delta["search_sources"] = deduped_sources
         final_delta["annotations"] = url_citation_annotations(deduped_sources)
@@ -276,7 +311,7 @@ def stream_grok_app_chat_completion(body: dict[str, Any], spec, messages: list[d
 
 
 def stream_grok_chat_completion(body: dict[str, Any], spec, messages: list[dict[str, Any]], model: str) -> Iterator[dict[str, Any]]:
-    if is_grok_app_chat_model(spec):
+    if grok_chat.is_app_chat_model(spec):
         yield from stream_grok_app_chat_completion(body, spec, messages, model)
         return
     include_usage = stream_include_usage(body)
@@ -285,8 +320,8 @@ def stream_grok_chat_completion(body: dict[str, Any], spec, messages: list[dict[
     sent_role = False
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
-    for event in grok.console_chat_completion_events(body, spec, messages):
-        delta = grok.extract_console_stream_delta(event)
+    for event in grok_chat.chat_completion_events(body, spec, messages):
+        delta = grok_chat.extract_console_stream_delta(event)
         if not delta.content and not delta.reasoning_content:
             continue
         if delta.reasoning_content:
@@ -320,6 +355,25 @@ def stream_grok_chat_completion(body: dict[str, Any], spec, messages: list[dict[
         )
 
 
+def stream_gemini_chat_completion(body: dict[str, Any], spec, messages: list[dict[str, Any]], model: str) -> Iterator[dict[str, Any]]:
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+    sent_role = False
+    content_parts: list[str] = []
+    for delta_text in gemini_chat.chat_completion_deltas(body, spec, messages):
+        content_parts.append(delta_text)
+        if not sent_role:
+            sent_role = True
+            yield stream_chunk(completion_chunk(model, {"role": "assistant", "content": delta_text}, None, completion_id, created), stream_include_usage(body))
+        else:
+            yield stream_chunk(completion_chunk(model, {"content": delta_text}, None, completion_id, created), stream_include_usage(body))
+    if not sent_role:
+        yield stream_chunk(completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created), stream_include_usage(body))
+    yield stream_chunk(completion_chunk(model, {}, "stop", completion_id, created), stream_include_usage(body))
+    if stream_include_usage(body):
+        yield completion_usage_chunk(model, completion_id, created, completion_usage(messages, model, "".join(content_parts)))
+
+
 def collect_chat_content(chunks: Iterable[dict[str, Any]]) -> str:
     parts: list[str] = []
     for chunk in chunks:
@@ -344,7 +398,7 @@ def chat_messages_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def prepare_text_messages(body: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    raw_messages = grok.strip_search_sources_from_messages(chat_messages_from_body(body))
+    raw_messages = grok_chat.strip_search_sources_from_messages(chat_messages_from_body(body))
     if tool_calls.has_function_tools(body):
         injected = tool_calls.inject_tool_prompt(
             raw_messages,
@@ -353,7 +407,7 @@ def prepare_text_messages(body: dict[str, Any]) -> tuple[list[dict[str, Any]], l
             body.get("parallel_tool_calls"),
         )
         return normalize_messages(injected), normalize_messages(raw_messages)
-    messages = normalize_messages(raw_messages)
+    messages = normalize_text_messages(normalize_messages(raw_messages))
     return messages, messages
 
 
@@ -376,11 +430,11 @@ def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]], li
     return model, messages, original_messages
 
 
-def parsed_chat_tool_response(body: dict[str, Any], model: str, content: str, messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+def parsed_chat_tool_response(body: dict[str, Any], model: str, content: str, messages: list[dict[str, Any]], gemini_native_tools: bool = False) -> dict[str, Any] | None:
     names = tool_calls.tool_names(body.get("tools"))
     if not names:
         return None
-    parsed = tool_calls.parse_tool_calls(content, names)
+    parsed = tool_calls.parse_gemini_openai_tool_response(content, body) if gemini_native_tools else tool_calls.parse_tool_calls(content, names)
     if not parsed.calls:
         return None
     return tool_calls.chat_tool_call_response(model, parsed.calls, messages=messages)
@@ -393,22 +447,33 @@ def image_result_content(result: dict[str, Any]) -> str:
     return str(result.get("message") or "Image generation completed.")
 
 
+def has_chat_image_input(body: dict[str, Any]) -> bool:
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    return any(isinstance(message, dict) and has_image_message_content(message.get("content")) for message in messages)
+
+
+def gemini_image_chat_unsupported() -> HTTPException:
+    return HTTPException(status_code=400, detail={"error": "Gemini Web image input is not supported by this upstream adapter"})
+
+
 def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
     model, prompt, n, images = chat_image_args(body)
     spec = resolve_model(model)
     if spec.provider == GROK_PROVIDER:
         if images:
-            from services.protocol.conversation import ImageGenerationError
             raise ImageGenerationError("Grok image chat does not support image input", status_code=400, error_type="invalid_request_error", code="unsupported_model", param="model")
-        result = collect_image_outputs(grok.app_chat_image_outputs(body, spec, prompt, n))
+        result = collect_image_outputs(image_generation_outputs(spec, None, body=body, prompt=prompt, n=n))
         return completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
-    result = collect_image_outputs(stream_image_outputs_with_pool(ConversationRequest(
+    request = ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
         response_format="b64_json",
         images=encode_images(images) or None,
-    )))
+    )
+    result = collect_image_outputs(image_generation_outputs(spec, request, body=body, prompt=prompt, n=n))
     return completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
 
 
@@ -417,17 +482,17 @@ def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     spec = resolve_model(model)
     if spec.provider == GROK_PROVIDER:
         if images:
-            from services.protocol.conversation import ImageGenerationError
             raise ImageGenerationError("Grok image chat does not support image input", status_code=400, error_type="invalid_request_error", code="unsupported_model", param="model")
-        yield from stream_image_chat_completion(grok.app_chat_image_outputs(body, spec, prompt, n), model)
+        yield from stream_image_chat_completion(image_generation_outputs(spec, None, body=body, prompt=prompt, n=n), model)
         return
-    image_outputs = stream_image_outputs_with_pool(ConversationRequest(
+    request = ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
         response_format="b64_json",
         images=encode_images(images) or None,
-    ))
+    )
+    image_outputs = image_generation_outputs(spec, request, body=body, prompt=prompt, n=n)
     yield from stream_image_chat_completion(image_outputs, model)
 
 
@@ -457,49 +522,15 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
     yield completion_chunk(model, {}, "stop", completion_id, created)
 
 
-def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
-    if body.get("stream"):
-        if is_image_chat_request(body):
-            return image_chat_events(body)
-        model, messages, _ = text_chat_parts(body)
-        spec = resolve_model(model)
-        if tool_calls.has_function_tools(body):
-            if spec.provider == GROK_PROVIDER:
-                if is_grok_app_chat_model(spec):
-                    response = grok.app_chat_completion(body, spec, messages)
-                    return stream_tool_chat_completion_from_text(
-                        response.get("content", ""),
-                        body,
-                        model,
-                        messages,
-                        include_usage=stream_include_usage(body),
-                        reasoning_content=response.get("reasoning_content", ""),
-                    )
-                response = grok.console_chat_completion(body, spec, messages)
-                return stream_tool_chat_completion_from_text(
-                    response.content,
-                    body,
-                    model,
-                    messages,
-                    include_usage=stream_include_usage(body),
-                    reasoning_content=response.reasoning_content,
-                )
-            return stream_tool_text_chat_completion(text_backend(), body, messages, model, stream_include_usage(body))
-        if spec.provider == GROK_PROVIDER:
-            return stream_grok_chat_completion(body, spec, messages, model)
-        return stream_text_chat_completion(text_backend(), messages, model, stream_include_usage(body))
-    if is_image_chat_request(body):
-        return image_chat_response(body)
-    model, messages, original_messages = text_chat_parts(body)
-    spec = resolve_model(model)
+def non_stream_text_chat_response(body: dict[str, Any], model: str, messages: list[dict[str, Any]], original_messages: list[dict[str, Any]], spec: Any) -> dict[str, Any]:
     if spec.provider == GROK_PROVIDER:
-        if is_grok_app_chat_model(spec):
-            response = grok.app_chat_completion(body, spec, messages)
+        if grok_chat.is_app_chat_model(spec):
+            response = grok_chat.chat_completion(body, spec, messages)
             raw_sources = response.get("search_sources")
             search_sources = cast(list[dict[str, str]], raw_sources) if isinstance(raw_sources, list) else []
             content = str(response.get("content", ""))
             if config.show_search_sources:
-                content = grok.append_search_sources_suffix(content, search_sources)
+                content = grok_chat.append_search_sources_suffix(content, search_sources)
             tool_response = parsed_chat_tool_response(body, model, content, messages)
             if tool_response:
                 return tool_response
@@ -511,20 +542,93 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
                 reasoning_content=response.get("reasoning_content", ""),
                 search_sources=search_sources,
             )
-        response = grok.console_chat_completion(body, spec, messages)
-        tool_response = parsed_chat_tool_response(body, model, response.content, messages)
+        response = grok_chat.chat_completion(body, spec, messages)
+        tool_response = parsed_chat_tool_response(body, model, response["content"], messages)
         if tool_response:
             return tool_response
         return completion_response(
             model,
-            response.content,
+            response["content"],
             messages=original_messages,
             tool_call_messages=messages,
-            reasoning_content=response.reasoning_content,
+            reasoning_content=response["reasoning_content"],
         )
-    request = ConversationRequest(model=model, messages=messages)
-    content = collect_text(text_backend(), request)
+    if spec.provider == GEMINI_PROVIDER:
+        response = gemini_chat.chat_completion(body, spec, messages)
+        tool_response = parsed_chat_tool_response(body, model, response.content, messages, gemini_native_tools=True)
+        if tool_response:
+            return tool_response
+        return completion_response(model, response.content, messages=original_messages, tool_call_messages=messages)
+    if collect_text is not gpt_chat.collect_text:
+        request = ConversationRequest(model=model, messages=messages)
+        content = collect_text(text_backend(), request)
+    else:
+        content = gpt_chat.chat_completion(body, messages, model, backend=text_backend())
     tool_response = parsed_chat_tool_response(body, model, content, messages)
     if tool_response:
         return tool_response
     return completion_response(model, content, messages=original_messages, tool_call_messages=messages)
+
+
+def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    if body.get("stream"):
+        model, messages, _ = text_chat_parts(body)
+        spec = resolve_model(model)
+        if spec.provider == GEMINI_PROVIDER and has_chat_image_input(body):
+            raise gemini_image_chat_unsupported()
+        if is_image_chat_request(body):
+            if spec.provider == GEMINI_PROVIDER and has_chat_image_input(body):
+                raise gemini_image_chat_unsupported()
+            return image_chat_events(body)
+        if tool_calls.has_function_tools(body):
+            if spec.provider == GROK_PROVIDER:
+                if grok_chat.is_app_chat_model(spec):
+                    response = grok_chat.chat_completion(body, spec, messages)
+                    return stream_tool_chat_completion_from_text(
+                        response.get("content", ""),
+                        body,
+                        model,
+                        messages,
+                        include_usage=stream_include_usage(body),
+                        reasoning_content=response.get("reasoning_content", ""),
+                    )
+                response = grok_chat.chat_completion(body, spec, messages)
+                return stream_tool_chat_completion_from_text(
+                    response["content"],
+                    body,
+                    model,
+                    messages,
+                    include_usage=stream_include_usage(body),
+                    reasoning_content=response["reasoning_content"],
+                )
+            if spec.provider == GEMINI_PROVIDER:
+                response = gemini_chat.chat_completion(body, spec, messages)
+                return stream_tool_chat_completion_from_text(
+                    response.content,
+                    body,
+                    model,
+                    messages,
+                    include_usage=stream_include_usage(body),
+                    gemini_native_tools=True,
+                )
+            return stream_tool_text_chat_completion(text_backend(), body, messages, model, stream_include_usage(body))
+        if spec.provider == GROK_PROVIDER:
+            return stream_grok_chat_completion(body, spec, messages, model)
+        if spec.provider == GEMINI_PROVIDER:
+            return stream_gemini_chat_completion(body, spec, messages, model)
+        return stream_text_chat_completion(text_backend(), messages, model, stream_include_usage(body))
+    model, messages, original_messages = text_chat_parts(body)
+    spec = resolve_model(model)
+    if spec.provider == GEMINI_PROVIDER and has_chat_image_input(body):
+        raise gemini_image_chat_unsupported()
+    if is_image_chat_request(body):
+        if spec.provider == GEMINI_PROVIDER and has_chat_image_input(body):
+            raise gemini_image_chat_unsupported()
+        return image_chat_response(body)
+    if is_cacheable_text_request(body, stream=False):
+        key = cache_key(body, messages, stream=False)
+        return chat_completion_cache.get_or_compute(
+            key,
+            lambda: non_stream_text_chat_response(body, model, messages, original_messages, spec),
+        )
+    return non_stream_text_chat_response(body, model, messages, original_messages, spec)

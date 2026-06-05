@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from services.models import GPT_PROVIDER, GPT_IMAGE_MODEL_IDS, gpt_fallback_model_metadata, grok_model_metadata
+from services.providers.base import GPT_PROVIDER
+from services.providers.gemini.models import gemini_model_metadata
+from services.providers.gpt.models import GPT_IMAGE_MODEL_IDS, gpt_fallback_model_metadata, gpt_image_model_metadata
+from services.providers.grok.models import grok_model_metadata
 
 
 def _append_model(data: list[dict[str, Any]], seen: set[str], item: dict[str, Any]) -> None:
@@ -71,18 +74,11 @@ def list_models() -> dict[str, Any]:
             _append_model(normalized_data, seen, _with_provider(item, GPT_PROVIDER))
     for item in gpt_fallback_model_metadata():
         _append_model(normalized_data, seen, item)
-    for model in sorted(GPT_IMAGE_MODEL_IDS):
-        _append_model(normalized_data, seen, {
-            "id": model,
-            "object": "model",
-            "created": 0,
-            "owned_by": "webchat2api",
-            "provider": GPT_PROVIDER,
-            "permission": [],
-            "root": model,
-            "parent": None,
-        })
+    for item in gpt_image_model_metadata():
+        _append_model(normalized_data, seen, item)
     for item in grok_model_metadata():
+        _append_model(normalized_data, seen, item)
+    for item in gemini_model_metadata():
         _append_model(normalized_data, seen, item)
     result["data"] = normalized_data
     return result

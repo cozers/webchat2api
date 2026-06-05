@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -19,6 +19,9 @@ from api.support import (
     sanitize_sub2api_servers,
 )
 from services.account_service import account_service
+from services.providers.base import GEMINI_PROVIDER, GROK_PROVIDER
+from services.providers.registry import normalize_account_provider, normalize_provider
+from services.providers.registry import account_strategy
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.remote_account_service import REMOTE_ACCOUNT_SYNC_FAILED, remote_account_config, remote_account_import_service
 from services.sub2api_service import (
@@ -43,26 +46,44 @@ class UserKeyUpdateRequest(BaseModel):
 class AccountCreateRequest(BaseModel):
     tokens: list[str] = Field(default_factory=list)
     accounts: list[dict[str, Any]] = Field(default_factory=list)
+    provider: Literal["gpt", "grok", "gemini"] | None = None
+
+
+class AccountDeleteIdentifier(BaseModel):
+    account_id: str | None = None
+    row_id: str | None = None
 
 
 class AccountDeleteRequest(BaseModel):
     tokens: list[str] = Field(default_factory=list)
+    identifiers: list[AccountDeleteIdentifier] = Field(default_factory=list)
     mode: Literal["tokens", "limited"] = "tokens"
+    provider: Literal["gpt", "grok", "gemini"] | None = None
 
 
 class AccountRefreshRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
+    identifiers: list[AccountDeleteIdentifier] = Field(default_factory=list)
+    provider: Literal["gpt", "grok", "gemini"] | None = None
+
+
+class AccountValidateRequest(BaseModel):
+    access_tokens: list[str] = Field(default_factory=list)
+    identifiers: list[AccountDeleteIdentifier] = Field(default_factory=list)
+    provider: Literal["gpt", "grok", "gemini"] | None = None
 
 
 class AccountExportRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
-    provider: Literal["gpt", "grok"]
+    identifiers: list[AccountDeleteIdentifier] = Field(default_factory=list)
+    provider: Literal["gpt", "grok", "gemini"]
 
 
 class AccountUpdateRequest(BaseModel):
     access_token: str = ""
     type: str | None = None
     provider: str | None = None
+    target_provider: Literal["gpt", "grok", "gemini"] | None = None
     status: str | None = None
     quota: int | None = None
 
@@ -113,7 +134,7 @@ class RemoteAccountSourceCreateRequest(BaseModel):
     auth_header: str = ""
     auth_token: str = ""
     bearer_token: str = ""
-    provider: Literal["", "gpt", "grok"] = ""
+    provider: Literal["", "gpt", "grok", "gemini"] = ""
     sync_strategy: Literal["merge", "replace"] = "merge"
     interval_seconds: int | None = None
 
@@ -126,7 +147,7 @@ class RemoteAccountSourceUpdateRequest(BaseModel):
     auth_header: str | None = None
     auth_token: str | None = None
     bearer_token: str | None = None
-    provider: Literal["", "gpt", "grok"] | None = None
+    provider: Literal["", "gpt", "grok", "gemini"] | None = None
     sync_strategy: Literal["merge", "replace"] | None = None
     interval_seconds: int | None = None
 
@@ -138,19 +159,161 @@ class RemoteAccountInjectRequest(BaseModel):
     strategy: Literal["merge", "replace"] = "merge"
     source_id: str = ""
     source_name: str = ""
-    provider: Literal["gpt", "grok"] = "gpt"
+    provider: Literal["gpt", "grok", "gemini"] = "gpt"
 
 
-def _account_payload_token(item: dict[str, Any]) -> str:
-    return str(item.get("access_token") or item.get("accessToken") or "").strip()
+def _account_payload_provider(item: dict[str, Any], provider: str | None) -> str:
+    provider_value = item.get("provider") or provider
+    if str(provider_value or "").strip():
+        return normalize_account_provider(provider_value)
+    return normalize_provider(provider_value)
+
+
+def _account_payload_token(item: dict[str, Any], provider: str | None = None) -> str:
+    try:
+        payload_provider = _account_payload_provider(item, provider)
+    except ValueError:
+        return ""
+    payload = dict(item)
+    payload.setdefault("provider", payload_provider)
+    return str(_account_strategy(payload_provider).normalize_access_token(payload) or "").strip()
 
 
 def _unique_tokens(tokens: list[str]) -> list[str]:
     return list(dict.fromkeys(str(token or "").strip() for token in tokens if str(token or "").strip()))
 
 
-def _export_filename(provider: Literal["gpt", "grok"]) -> str:
-    return "webchat2api-gpt.txt" if provider == "gpt" else "webchat2api_grok.txt"
+def _should_refresh_created_accounts(provider: str | None) -> bool:
+    return normalize_provider(provider) != GROK_PROVIDER
+
+
+def _delete_identifiers(identifiers: Sequence[AccountDeleteIdentifier | dict[str, Any]]) -> list[dict[str, str]]:
+    payloads: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for identifier in identifiers:
+        payload: dict[str, str] = {}
+        if isinstance(identifier, dict):
+            raw_account_id = identifier.get("account_id")
+            raw_row_id = identifier.get("row_id")
+        else:
+            raw_account_id = identifier.account_id
+            raw_row_id = identifier.row_id
+        account_id = str(raw_account_id or "").strip()
+        row_id = str(raw_row_id or "").strip()
+        if account_id:
+            payload["account_id"] = account_id
+        if row_id:
+            payload["row_id"] = row_id
+        if not payload:
+            continue
+        key = (payload.get("account_id", ""), payload.get("row_id", ""))
+        if key in seen:
+            continue
+        payloads.append(payload)
+        seen.add(key)
+    return payloads
+
+
+def _account_strategy(provider: Any):
+    return account_strategy(normalize_account_provider(provider))
+
+
+def _gemini_import_requested(provider: str | None, payloads: list[dict[str, Any]]) -> bool:
+    if normalize_provider(provider) == GEMINI_PROVIDER:
+        return True
+    for item in payloads:
+        provider_value = str(item.get("provider") or "").strip()
+        if not provider_value:
+            continue
+        try:
+            if normalize_account_provider(provider_value) == GEMINI_PROVIDER:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _validate_gemini_import_payloads(tokens: list[str], payloads: list[dict[str, Any]], provider: str | None) -> None:
+    if not _gemini_import_requested(provider, payloads):
+        return
+    if tokens:
+        raise HTTPException(status_code=400, detail={"error": "Gemini 目前只支持 Cookie 双字段导入，请分别填写 __Secure-1PSID 和 __Secure-1PSIDTS 的值"})
+    if not payloads:
+        raise HTTPException(status_code=400, detail={"error": "Gemini 目前只支持 Cookie 双字段导入"})
+    top_level_gemini = normalize_provider(provider) == GEMINI_PROVIDER
+    allowed_keys = {"provider", "__Secure-1PSID", "__Secure-1PSIDTS"}
+    for item in payloads:
+        item_provider = str(item.get("provider") or "").strip()
+        if top_level_gemini and item_provider and normalize_account_provider(item_provider) != GEMINI_PROVIDER:
+            raise HTTPException(status_code=400, detail={"error": "Gemini 导入不能混用其他供应商账号"})
+        extra_keys = {key for key, value in item.items() if value is not None} - allowed_keys
+        if extra_keys:
+            raise HTTPException(status_code=400, detail={"error": "Gemini 目前只支持 Cookie 双字段导入，不支持完整 Cookie、access_token、JSON 或其他导入方式"})
+        psid = str(item.get("__Secure-1PSID") or "").strip()
+        psidts = str(item.get("__Secure-1PSIDTS") or "").strip()
+        if not psid or not psidts:
+            raise HTTPException(status_code=400, detail={"error": "请分别填写 __Secure-1PSID 和 __Secure-1PSIDTS 的值"})
+        if "=" in psid or ";" in psid or "=" in psidts or ";" in psidts:
+            raise HTTPException(status_code=400, detail={"error": "Gemini Cookie 双字段只接受等号右侧的值，不要包含 cookie 名称、等号或分号"})
+
+
+def _normalize_grok_sso_import_token(value: str) -> str:
+    token = str(value or "").strip()
+    if not token or ";" in token:
+        return ""
+    name, separator, cookie_value = token.partition("=")
+    if separator:
+        return cookie_value.strip() if name.strip().lower() == "sso" and cookie_value.strip() else ""
+    return token
+
+
+def _grok_import_requested(provider: str | None, payloads: list[dict[str, Any]]) -> bool:
+    if normalize_provider(provider) == GROK_PROVIDER:
+        return True
+    for item in payloads:
+        provider_value = str(item.get("provider") or "").strip()
+        if not provider_value:
+            continue
+        try:
+            if normalize_account_provider(provider_value) == GROK_PROVIDER:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _validate_grok_import_payloads(tokens: list[str], payloads: list[dict[str, Any]], provider: str | None) -> list[str]:
+    if not _grok_import_requested(provider, payloads):
+        return tokens
+    if payloads:
+        raise HTTPException(status_code=400, detail={"error": "Grok 导入只接受裸 SSO 值，或每行一个 sso=<值>；不支持 sso-rw、完整 Cookie header、JSON、CPA、cookies 或 accounts 账号 payload"})
+    if not tokens:
+        raise HTTPException(status_code=400, detail={"error": "Grok 导入只接受裸 SSO 值，或每行一个 sso=<值>"})
+    normalized_tokens = [_normalize_grok_sso_import_token(token) for token in tokens]
+    if not all(normalized_tokens):
+        raise HTTPException(status_code=400, detail={"error": "Grok 导入只接受裸 SSO 值，或每行一个 sso=<值>；不支持 sso-rw、完整 Cookie header、其他 Cookie 名称、JSON、CPA、cookies 或 accounts 账号 payload"})
+    return normalized_tokens
+
+
+def _export_filename(provider: Literal["gpt", "grok", "gemini"]) -> str:
+    return _account_strategy(provider).export_filename()
+
+
+def sanitize_account(item: dict[str, Any]) -> dict[str, Any]:
+    return _account_strategy(item.get("provider")).sanitize_account(item)
+
+
+def sanitize_accounts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [sanitize_account(item) for item in items]
+
+
+def sanitize_account_result(result: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(result)
+    if isinstance(sanitized.get("items"), list):
+        sanitized["items"] = sanitize_accounts([item for item in sanitized["items"] if isinstance(item, dict)])
+    if isinstance(sanitized.get("item"), dict):
+        sanitized["item"] = sanitize_account(sanitized["item"])
+    return sanitized
 
 
 def create_router() -> APIRouter:
@@ -204,61 +367,102 @@ def create_router() -> APIRouter:
         return {"items": auth_service.list_keys(role="user")}
 
     @router.get("/api/accounts")
-    async def get_accounts(authorization: str | None = Header(default=None)):
+    async def get_accounts(provider: Literal["gpt", "grok", "gemini"] | None = None, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": account_service.list_accounts()}
+        return {"items": sanitize_accounts(account_service.list_accounts(provider=provider))}
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         account_payloads = [item for item in body.accounts if isinstance(item, dict)]
-        payload_tokens = [_account_payload_token(item) for item in account_payloads]
-        tokens = _unique_tokens([*body.tokens, *payload_tokens])
+        raw_tokens = [str(token or "").strip() for token in body.tokens if str(token or "").strip()]
+        _validate_gemini_import_payloads(raw_tokens, account_payloads, body.provider)
+        body_tokens = _validate_grok_import_payloads(raw_tokens, account_payloads, body.provider)
+        scoped_payloads = [{**item, "provider": item.get("provider") or body.provider} for item in account_payloads]
+        payload_tokens = [_account_payload_token(item, body.provider) for item in scoped_payloads]
+        tokens = _unique_tokens([*body_tokens, *payload_tokens])
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
-        if account_payloads:
-            result = account_service.add_account_items(account_payloads)
+        if scoped_payloads:
+            result = account_service.add_account_items(scoped_payloads)
+            saved_tokens = {
+                str(item.get("access_token") or "").strip()
+                for item in result.get("items", [])
+                if isinstance(item, dict) and str(item.get("access_token") or "").strip()
+            }
             payload_token_set = set(_unique_tokens(payload_tokens))
             extra_tokens = [token for token in tokens if token not in payload_token_set]
             if extra_tokens:
-                extra_result = account_service.add_accounts(extra_tokens)
+                extra_result = account_service.add_accounts(extra_tokens, provider=body.provider)
                 result["added"] = int(result.get("added") or 0) + int(extra_result.get("added") or 0)
                 result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
+                for item in extra_result.get("items", []):
+                    if isinstance(item, dict) and (token := str(item.get("access_token") or "").strip()):
+                        saved_tokens.add(token)
+            refresh_tokens = [token for token in tokens if token in saved_tokens]
         else:
-            result = account_service.add_accounts(tokens)
-        refresh_result = account_service.refresh_accounts(tokens)
-        return {
+            result = account_service.add_accounts(tokens, provider=body.provider)
+            saved_tokens = {
+                str(item.get("access_token") or "").strip()
+                for item in result.get("items", [])
+                if isinstance(item, dict) and str(item.get("access_token") or "").strip()
+            }
+            refresh_tokens = [token for token in tokens if token in saved_tokens]
+            if not refresh_tokens and not int(result.get("added") or 0) and not int(result.get("skipped") or 0):
+                raise HTTPException(status_code=400, detail={"error": "tokens is required"})
+        if _should_refresh_created_accounts(body.provider):
+            refresh_result = account_service.refresh_accounts(refresh_tokens, provider=body.provider)
+        else:
+            refresh_result = {"refreshed": 0, "errors": [], "items": result.get("items", [])}
+        return sanitize_account_result({
             **result,
             "refreshed": refresh_result.get("refreshed", 0),
             "errors": refresh_result.get("errors", []),
             "items": refresh_result.get("items", result.get("items", [])),
-        }
+        })
 
     @router.delete("/api/accounts")
     async def delete_accounts(body: AccountDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         if body.mode == "limited":
-            return account_service.delete_limited_accounts()
+            return sanitize_account_result(account_service.delete_limited_accounts(provider=body.provider))
         tokens = [str(token or "").strip() for token in body.tokens if str(token or "").strip()]
-        if not tokens:
-            raise HTTPException(status_code=400, detail={"error": "tokens is required"})
-        return account_service.delete_accounts(tokens)
+        identifiers = _delete_identifiers(body.identifiers)
+        if not tokens and not identifiers:
+            raise HTTPException(status_code=400, detail={"error": "tokens or identifiers is required"})
+        return sanitize_account_result(account_service.delete_accounts(tokens, provider=body.provider, identifiers=identifiers))
 
     @router.post("/api/accounts/refresh")
     async def refresh_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         access_tokens = [str(token or "").strip() for token in body.access_tokens if str(token or "").strip()]
-        if not access_tokens:
-            access_tokens = account_service.list_tokens()
-        if not access_tokens:
-            raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
-        return account_service.refresh_accounts(access_tokens)
+        identifiers = _delete_identifiers(body.identifiers)
+        if not access_tokens and not identifiers:
+            access_tokens = account_service.list_tokens(provider=body.provider)
+        if not access_tokens and not identifiers:
+            raise HTTPException(status_code=400, detail={"error": "access_tokens or identifiers is required"})
+        return sanitize_account_result(account_service.refresh_accounts(access_tokens, provider=body.provider, identifiers=identifiers))
+
+    @router.post("/api/accounts/validate")
+    async def validate_accounts(body: AccountValidateRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        provider = normalize_account_provider(body.provider or GROK_PROVIDER)
+        if provider != GROK_PROVIDER:
+            raise HTTPException(status_code=400, detail={"error": "unsupported provider for account validation"})
+        access_tokens = [str(token or "").strip() for token in body.access_tokens if str(token or "").strip()]
+        identifiers = _delete_identifiers(body.identifiers)
+        if not access_tokens and not identifiers:
+            access_tokens = account_service.list_tokens(provider=provider)
+        if not access_tokens and not identifiers:
+            raise HTTPException(status_code=400, detail={"error": "access_tokens or identifiers is required"})
+        return sanitize_account_result(account_service.validate_accounts(access_tokens, provider=provider, identifiers=identifiers))
 
     @router.post("/api/accounts/export")
     async def export_accounts(body: AccountExportRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         access_tokens = _unique_tokens(body.access_tokens)
-        items = account_service.build_export_items(access_tokens, provider=body.provider)
+        identifiers = _delete_identifiers(body.identifiers)
+        items = account_service.build_export_items(access_tokens, provider=body.provider, identifiers=identifiers)
         if not items:
             raise HTTPException(
                 status_code=400,
@@ -290,10 +494,10 @@ def create_router() -> APIRouter:
         }
         if not updates:
             raise HTTPException(status_code=400, detail={"error": "还没有检测到改动，请修改后再保存"})
-        account = account_service.update_account(access_token, updates)
+        account = account_service.update_account(access_token, updates, provider=body.target_provider)
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
-        return {"item": account, "items": account_service.list_accounts()}
+        return {"item": sanitize_account(account), "items": sanitize_accounts(account_service.list_accounts(provider=body.target_provider))}
 
     @router.get("/api/cpa/pools")
     async def list_cpa_pools(authorization: str | None = Header(default=None)):

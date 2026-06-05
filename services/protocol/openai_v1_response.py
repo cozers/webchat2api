@@ -1,24 +1,23 @@
 from __future__ import annotations
 
-import base64
 import time
 import uuid
 from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
 
-from services.models import GROK_PROVIDER, is_grok_app_chat_model, resolve_model
-from services.providers import grok
+from api.image_inputs import resolve_inline_image_reference
+
+from services.providers.base import ConversationRequest, GEMINI_PROVIDER, GROK_PROVIDER, ImageGenerationError, ImageOutput
+from services.providers.registry import chat_adapter, resolve_model, response_image_outputs
 import services.protocol.tool_calls as tool_calls
-from services.protocol.conversation import (
-    ConversationRequest,
-    ImageOutput,
-    encode_images,
-    stream_image_outputs_with_pool,
-    stream_text_deltas,
-    text_backend,
-)
-from utils.helper import extract_image_from_message_content, extract_response_prompt, has_response_image_generation_tool
+from services.protocol.conversation import encode_images, stream_text_deltas, text_backend
+from utils.helper import extract_image_from_message_content, extract_response_prompt, has_image_message_content, has_response_image_generation_tool
+
+
+gpt_chat = chat_adapter("gpt")
+grok_chat = chat_adapter("grok")
+gemini_chat = chat_adapter("gemini")
 
 
 def is_text_response_request(body: dict[str, Any]) -> bool:
@@ -27,22 +26,51 @@ def is_text_response_request(body: dict[str, Any]) -> bool:
 
 def extract_response_image(input_value: object) -> tuple[bytes, str] | None:
     if isinstance(input_value, dict):
-        images = extract_image_from_message_content(input_value.get("content"))
-        return images[0] if images else None
+        content_image = _extract_response_image_from_content(input_value.get("content"))
+        if content_image:
+            return content_image
+        return _image_tuple_from_reference(input_value)
     if not isinstance(input_value, list):
         return None
     for item in reversed(input_value):
         if isinstance(item, dict) and str(item.get("type") or "").strip() == "input_image":
-            image_url = str(item.get("image_url") or "")
-            if image_url.startswith("data:"):
-                header, _, data = image_url.partition(",")
-                mime = header.split(";")[0].removeprefix("data:")
-                return base64.b64decode(data), mime or "image/png"
+            image = _image_tuple_from_reference(item)
+            if image:
+                return image
         if isinstance(item, dict):
-            images = extract_image_from_message_content(item.get("content"))
-            if images:
-                return images[0]
+            content_image = _extract_response_image_from_content(item.get("content"))
+            if content_image:
+                return content_image
     return None
+
+
+def _extract_response_image_from_content(content: object) -> tuple[bytes, str] | None:
+    if not isinstance(content, list):
+        return None
+    for item in reversed(content):
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip()
+        if item_type in {"input_image", "image_url"}:
+            image = _image_tuple_from_reference(item)
+            if image:
+                return image
+    images = extract_image_from_message_content(content)
+    return images[0] if images else None
+
+
+def _image_tuple_from_reference(value: object) -> tuple[bytes, str] | None:
+    image = resolve_inline_image_reference(value)
+    if image is None:
+        return None
+    data, _filename, mime_type = image
+    return data, mime_type
+
+
+def _typed_response_content(items: list[dict[str, Any]]) -> str | list[dict[str, Any]]:
+    if any(has_image_message_content([item]) for item in items):
+        return [dict(item) for item in items]
+    return extract_response_prompt(items)
 
 
 def messages_from_input(input_value: object, instructions: object = None) -> list[dict[str, Any]]:
@@ -59,9 +87,9 @@ def messages_from_input(input_value: object, instructions: object = None) -> lis
         return messages
     if isinstance(input_value, list):
         if all(isinstance(item, dict) and item.get("type") for item in input_value):
-            text = extract_response_prompt(input_value)
-            if text:
-                messages.append({"role": "user", "content": text})
+            content = _typed_response_content(input_value)
+            if content:
+                messages.append({"role": "user", "content": content})
             return messages
         for item in input_value:
             if isinstance(item, dict):
@@ -90,9 +118,16 @@ def _messages_from_response_item(item: dict[str, Any]) -> list[dict[str, Any]]:
             "tool_call_id": str(item.get("call_id") or item.get("tool_call_id") or ""),
             "content": str(item.get("output") or item.get("content") or ""),
         }]
+    content = item.get("content")
+    if has_image_message_content(content):
+        message_content = content
+    elif has_image_message_content([item]):
+        message_content = _typed_response_content([item])
+    else:
+        message_content = extract_response_prompt([item]) or content or ""
     return [{
         "role": str(item.get("role") or "user"),
-        "content": extract_response_prompt([item]) or item.get("content") or "",
+        "content": message_content,
     }]
 
 
@@ -203,14 +238,17 @@ def stream_text_response(backend, body: dict[str, Any]) -> Iterator[dict[str, An
     created = int(time.time())
     yield response_created(response_id, model, created)
     request = ConversationRequest(model=model, messages=messages)
-    full_text = "".join(stream_text_deltas(backend, request))
+    if stream_text_deltas is not gpt_chat.stream_text_deltas:
+        full_text = "".join(stream_text_deltas(backend, request))
+    else:
+        full_text = gpt_chat.chat_completion(body, messages, model, backend=backend)
     yield from stream_response_output_items(response_output_from_text(body, full_text), response_id, model, created)
 
 
 def stream_grok_console_response(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     model = str(body.get("model") or "auto").strip() or "auto"
     spec = resolve_model(model)
-    if is_grok_app_chat_model(spec):
+    if grok_chat.is_app_chat_model(spec):
         raise HTTPException(status_code=501, detail={"error": "Grok app-chat is not supported on /v1/responses"})
     messages, _ = prepare_response_messages(body)
     if not messages:
@@ -218,8 +256,22 @@ def stream_grok_console_response(body: dict[str, Any]) -> Iterator[dict[str, Any
     response_id = f"resp_{uuid.uuid4().hex}"
     created = int(time.time())
     yield response_created(response_id, model, created)
-    completion = grok.console_chat_completion(body, spec, messages)
-    yield from stream_response_output_items(response_output_from_text(body, completion.content), response_id, model, created)
+    completion = grok_chat.chat_completion(body, spec, messages)
+    yield from stream_response_output_items(response_output_from_text(body, completion["content"]), response_id, model, created)
+
+
+def stream_gemini_response(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    model = str(body.get("model") or "auto").strip() or "auto"
+    spec = resolve_model(model)
+    messages, _ = prepare_response_messages(body)
+    if not messages:
+        raise HTTPException(status_code=400, detail={"error": "input text is required"})
+    response_id = f"resp_{uuid.uuid4().hex}"
+    created = int(time.time())
+    yield response_created(response_id, model, created)
+    completion = gemini_chat.chat_completion(body, spec, messages)
+    content = str(getattr(completion, "content", ""))
+    yield from stream_response_output_items(response_output_from_text(body, content), response_id, model, created)
 
 
 def stream_image_response(image_outputs: Iterable[ImageOutput], prompt: str, model: str) -> Iterator[dict[str, Any]]:
@@ -263,6 +315,9 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         if spec.provider == GROK_PROVIDER:
             yield from stream_grok_console_response(body)
             return
+        if spec.provider == GEMINI_PROVIDER:
+            yield from stream_gemini_response(body)
+            return
         yield from stream_text_response(text_backend(), body)
         return
 
@@ -276,13 +331,18 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         images = encode_images([(image_data, "image.png", mime_type)])
     else:
         images = None
-    image_outputs = stream_image_outputs_with_pool(ConversationRequest(
+    request = ConversationRequest(
         prompt=prompt,
         model=model,
         size=None if images else "1:1",
         response_format="b64_json",
         images=images,
-    ))
+    )
+    spec = resolve_model(model)
+    if spec.provider == GROK_PROVIDER:
+        if images:
+            raise ImageGenerationError("Grok response image generation does not support image input", status_code=400, error_type="invalid_request_error", code="unsupported_model", param="model")
+    image_outputs = response_image_outputs(spec, request, body=body, prompt=prompt, n=1)
     yield from stream_image_response(image_outputs, prompt, model)
 
 

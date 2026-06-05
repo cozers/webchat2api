@@ -10,7 +10,9 @@ from services.content_filter import check_request, request_text
 from services.log_service import LoggedCall
 from services.protocol import (
     anthropic_v1_messages,
+    openai_search,
     openai_v1_chat_complete,
+    openai_v1_complete,
     openai_v1_image_edit,
     openai_v1_image_generations,
     openai_v1_models,
@@ -36,6 +38,19 @@ class ChatCompletionRequest(BaseModel):
     stream: bool | None = None
     modalities: list[str] | None = None
     messages: list[dict[str, object]] | None = None
+
+
+class SearchRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    prompt: str = Field(..., min_length=1)
+    model: str = "gpt-5-5"
+
+
+class CompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    model: str | None = None
+    prompt: str | list[str] = Field(..., min_length=1)
+    stream: bool | None = None
 
 
 class ResponseCreateRequest(BaseModel):
@@ -66,6 +81,7 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
 def create_router() -> APIRouter:
     router = APIRouter()
 
+    @router.get("/openai/v1/models", include_in_schema=False)
     @router.get("/v1/models")
     async def list_models(
             authorization: str | None = Header(default=None),
@@ -105,6 +121,7 @@ def create_router() -> APIRouter:
         payload["base_url"] = resolve_image_base_url(request)
         return await call.run(openai_v1_image_edit.handle, payload)
 
+    @router.post("/openai/v1/chat/completions", include_in_schema=False)
     @router.post("/v1/chat/completions")
     async def create_chat_completion(
             body: ChatCompletionRequest,
@@ -118,6 +135,36 @@ def create_router() -> APIRouter:
         call = LoggedCall(identity, "/v1/chat/completions", model, "文本生成", request_text=request_preview)
         await filter_or_log(call, request_preview)
         return await call.run(openai_v1_chat_complete.handle, payload)
+
+    @router.post("/v1/search")
+    async def create_search(
+            body: SearchRequest,
+            authorization: str | None = Header(default=None),
+            x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    ):
+        identity = require_identity(authorization or (f"Bearer {x_api_key}" if x_api_key else None))
+        payload = body.model_dump(mode="python")
+        prompt = str(payload.get("prompt") or "")
+        model = str(payload.get("model") or "gpt-5-5")
+        call = LoggedCall(identity, "/v1/search", model, "Search", request_text=prompt)
+        await filter_or_log(call, prompt)
+        return await call.run(openai_search.handle, payload)
+
+    @router.post("/v1/completions")
+    @router.post("/v1/complete")
+    async def create_completion(
+            body: CompletionRequest,
+            authorization: str | None = Header(default=None),
+            x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    ):
+        identity = require_identity(authorization or (f"Bearer {x_api_key}" if x_api_key else None))
+        payload = body.model_dump(mode="python")
+        model = str(payload.get("model") or "auto")
+        prompt = payload.get("prompt")
+        request_preview = request_text(prompt)
+        call = LoggedCall(identity, "/v1/complete", model, "Completion", request_text=request_preview)
+        await filter_or_log(call, request_preview)
+        return await call.run(openai_v1_complete.handle, payload)
 
     @router.post("/v1/responses")
     async def create_response(
@@ -133,6 +180,7 @@ def create_router() -> APIRouter:
         await filter_or_log(call, request_preview)
         return await call.run(openai_v1_response.handle, payload)
 
+    @router.post("/claude/v1/messages", include_in_schema=False)
     @router.post("/v1/messages")
     async def create_message(
             body: AnthropicMessageRequest,

@@ -1,8 +1,8 @@
 # webchat2api 技术指南
 
-版本：0.0.9
+版本：0.0.10
 
-本文是 webchat2api 0.0.9 的 canonical 技术手册，面向部署、集成、运维和排障。文档只描述当前实现，不代表 OpenAI 或 xAI 官方 API 支持。
+本文是 webchat2api 0.0.10 的 canonical 技术手册，面向部署、集成、运维和排障。文档只描述当前实现，不代表 OpenAI、xAI 或 Google 官方 API 支持。
 
 ## 1. 项目定位与边界
 
@@ -11,13 +11,14 @@ webchat2api 将网页端 Chat 服务封装为类 OpenAI API 风格的代理服�
 核心定位：
 
 - 后端由 FastAPI 提供 OpenAI 风格 API、管理 API、图片任务 API 和静态 Web 管理端回退路由。
-- 文本 API 支持 GPT 与 Grok 两类 provider，`/v1/chat/completions` 按请求 `model` 分发。
-- `/v1/models` 优先通过 `provider=gpt` 账号动态拉取 GPT 模型，并合并内置 GPT fallback 与静态 Grok 模型。
+- 文本 API 支持 GPT、Grok 与 Gemini 三类 provider，`/v1/chat/completions`、`/v1/completions` 和 `/v1/complete` 按请求 `model` 分发。
+- `/v1/models` 优先通过 `provider=gpt` 账号动态拉取 GPT 模型，并合并内置 GPT fallback、静态 Grok 模型与静态 Gemini 模型。
+- Gemini native API 位于 `/gemini/v1beta/*`，提供 models、generateContent、streamGenerateContent、deepresearch、deepresearch/stream、interactions 和 interactions/{id}。
 - Grok 分为 Console 与 app-chat 两条网页端链路：无 `mode_id` 的 Grok 文本模型走 Console Responses，带 `mode_id` 的文本、图片生成和图片编辑走 grok.com app-chat。
-- 图片生成和图片编辑支持 GPT 图片路径与 Grok app-chat imagine 路径；`grok-imagine-video` 只在模型表声明，当前执行时返回不支持。
+- 图片生成和图片编辑支持 GPT 图片路径与 Grok app-chat imagine 路径；`grok-imagine-video` 只在模型表声明，当前执行时返回不支持，Grok files 和 voice 仍未接入。
 - Web 管理端提供账号池、用户密钥、代理、日志、图片任务、图片文件、Cloudflare R2 备份、图片存储和系统配置管理。
-- 试验页支持文生文聊天、文本模型批量可用性测试、文生图/图生图切换、图片队列和图片历史。
 - 文生文聊天历史保存在浏览器本地，刷新页面后仍保留。
+- 试验页支持文生文聊天、文本模型批量可用性测试、按 provider 过滤的文生图/图生图、图片队列和图片历史。
 - 支持本地敏感词与可选 OpenAI 兼容 AI 审核；审核前移除 base64 data URI 并截断长文本，`fail_open` 默认放行。
 - 支持 Docker CLI 与 Docker Compose 部署；镜像内包含 Python 3.13 slim、uv、Chromium、Node/npm、Playwright bridge 依赖和 Web 静态产物。
 
@@ -27,7 +28,7 @@ webchat2api 将网页端 Chat 服务封装为类 OpenAI API 风格的代理服�
 | --- | --- |
 | 服务地址 | `http://localhost:83` |
 | 管理后台 | `http://localhost:83` |
-| API Base URL | `http://localhost:83/v1` |
+| API Base URL | `http://localhost:83/v1`；兼容上游 OpenAI 前缀时可使用 `http://localhost:83/openai/v1` |
 | 默认登录密钥 | `admin` |
 
 生产环境部署后必须立即修改默认登录密钥，避免未授权访问。
@@ -44,6 +45,7 @@ webchat2api
 ├── ChatGPT Web 链路
 ├── Grok Console 链路
 ├── Grok app-chat 链路
+├── Gemini Web 链路
 ├── 图片生成 / 编辑 / 任务模块
 ├── 远程账号注入模块
 ├── 网络 Profile 模块
@@ -62,9 +64,11 @@ webchat2api
 | API 服务层 | `main.py`、`api/app.py`、`api/ai.py`、`api/accounts.py`、`api/system.py`、`api/image_tasks.py` | 接收 HTTP 请求、校验参数和鉴权、调用账号池与 provider、返回 JSON 或 OpenAI 风格响应。 |
 | Web 管理端 | `web/`、`web/src/app/`、`web/src/components/`、`web/src/store/` | 管理后台、账号池、配置、日志、图片任务、图片文件和试验页。 |
 | 鉴权 | `services/config.py`、`services/auth_service.py`、`api/support.py` | 登录密钥、用户 API Key、Bearer 与部分 `x-api-key` 支持。 |
-| 账号与来源 | `services/account_service.py`、`services/cpa_service.py`、`services/sub2api_service.py`、`services/remote_account_service.py`、`services/storage/` | 保存账号、刷新状态、导入 CPA/Sub2API/GPT/Grok/远程来源、导出凭据。 |
-| 模型与协议 | `services/models.py`、`services/protocol/openai_v1_chat_complete.py`、`services/providers/grok.py` | 维护模型规格、Provider 分发、OpenAI 兼容响应封装。 |
-| 网络与上游 | `services/network/`、`services/browser_bridge/`、`services/providers/grok.py` | ChatGPT、Grok Console、Grok app-chat、Browser Bridge、FlareSolverr、代理。 |
+| 账号与来源 | `services/account_service.py`、`services/providers/gpt/accounts.py`、`services/providers/grok/accounts.py`、`services/providers/gemini/accounts.py`、`services/cpa_service.py`、`services/sub2api_service.py`、`services/remote_account_service.py`、`services/storage/` | 保存账号、刷新状态、导入 CPA/Sub2API/GPT/Grok/Gemini/远程来源、按 provider 归一化和导出凭据。 |
+| 模型与协议 | `services/providers/base.py`、`services/providers/registry.py`、`services/providers/*/models.py`、`services/models.py`、`services/protocol/` | 维护 provider 常量、模型规格、模型注册表、兼容 facade 和 OpenAI/Gemini 兼容响应封装。 |
+| Provider 上游链路 | `services/providers/gpt/`、`services/providers/grok/`、`services/providers/gemini/` | GPT、Grok、Gemini 各自的文本、图片、账号和上游客户端逻辑。 |
+| 前端 provider 注册 | `web/src/providers/`、`web/src/app/accounts/`、`web/src/app/image/` | 账号页导入导出文案、刷新能力、额度展示、provider 标签，以及试验页 provider 选择。 |
+| 网络与上游 | `services/network/`、`services/browser_bridge/` | ChatGPT、Grok Console、Grok app-chat、Gemini Web、Browser Bridge、FlareSolverr、代理。 |
 | 存储与备份 | `services/backup_service.py`、`services/image_storage_service.py`、`services/image_service.py`、`services/image_tags_service.py` | Cloudflare R2 备份、本地/WebDAV/双写图片存储、图片索引和标签。 |
 | 内容过滤与日志 | `services/content_filter.py`、`services/log_service.py` | 敏感词、可选 AI 审核、日志写入和查询。 |
 
@@ -92,12 +96,22 @@ webchat2api
 | `/health` | `GET` | 无 | 健康检查，期望返回 `{"status":"ok"}`。 |
 | `/version` | `GET` | 无 | 版本查询。 |
 | `/auth/login` | `POST` | 登录密钥 | 管理后台登录。 |
-| `/v1/models` | `GET` | Bearer；也支持 `x-api-key` | 返回 GPT 与 Grok 模型。 |
+| `/v1/models` | `GET` | Bearer；也支持 `x-api-key` | 返回 GPT、Grok 与 Gemini 模型。 |
 | `/v1/chat/completions` | `POST` | Bearer；也支持 `x-api-key` | 文本聊天公共入口，按 `model` 路由。 |
+| `/v1/completions` | `POST` | Bearer；也支持 `x-api-key` | 标准文本补全入口。 |
+| `/v1/complete` | `POST` | Bearer；也支持 `x-api-key` | 文本补全兼容别名。 |
 | `/v1/responses` | `POST` | Bearer；也支持 `x-api-key` | Responses 兼容入口。 |
 | `/v1/messages` | `POST` | Bearer；也支持 `x-api-key` | Messages 兼容入口。 |
 | `/v1/images/generations` | `POST` | Bearer | 图片生成。 |
 | `/v1/images/edits` | `POST` | Bearer | 图片编辑。 |
+| `/openai/v1/models` | `GET` | Bearer；也支持 `x-api-key` | `/v1/models` 的 OpenAI-compatible alias，不在 OpenAPI schema 中重复展示。 |
+| `/openai/v1/chat/completions` | `POST` | Bearer；也支持 `x-api-key` | `/v1/chat/completions` 的 OpenAI-compatible alias，不在 OpenAPI schema 中重复展示。 |
+| `/claude/v1/messages` | `POST` | Bearer；也支持 `x-api-key` | `/v1/messages` 的 Claude-compatible alias，不在 OpenAPI schema 中重复展示。 |
+| `/gemini/v1beta/models` | `GET` | Bearer | Gemini native 模型列表。 |
+| `/gemini/v1beta/models/{model}:generateContent` | `POST` | Bearer | Gemini native 非流式生成。 |
+| `/gemini/v1beta/models/{model}:streamGenerateContent` | `POST` | Bearer | Gemini native synthetic SSE 流式生成。 |
+| `/gemini/v1beta/deepresearch`、`/gemini/v1beta/deepresearch/stream` | `POST` | Bearer | Gemini deep research 非流式/流式入口。 |
+| `/gemini/v1beta/interactions`、`/gemini/v1beta/interactions/{id}` | `POST` / `GET` | Bearer | Gemini interaction 创建和按 owner 隔离读取。 |
 
 鉴权头：
 
@@ -105,7 +119,7 @@ webchat2api
 Authorization: Bearer <密钥>
 ```
 
-`x-api-key: <密钥>` 仅适用于 `/v1/models`、`/v1/chat/completions`、`/v1/responses` 和 `/v1/messages`。图片接口与管理接口仍使用 Bearer Token。
+`x-api-key: <密钥>` 适用于 `/v1/models`、`/v1/chat/completions`、`/v1/completions`、`/v1/complete`、`/v1/responses`、`/v1/messages`、`/openai/v1/models`、`/openai/v1/chat/completions` 和 `/claude/v1/messages`。图片接口、Gemini native 接口与管理接口仍使用 Bearer Token。
 
 登录密钥优先级：
 
@@ -142,6 +156,8 @@ curl http://localhost:83/health
 curl http://localhost:83/version
 curl http://localhost:83/v1/models \
   -H "Authorization: Bearer YOUR_API_KEY"
+curl http://localhost:83/openai/v1/models \
+  -H "x-api-key: YOUR_API_KEY"
 ```
 
 聊天：
@@ -156,7 +172,31 @@ curl http://localhost:83/v1/chat/completions \
       {"role": "user", "content": "你好"}
     ]
   }'
+
+curl http://localhost:83/openai/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -d '{
+    "model": "gemini-2.5-flash",
+    "messages": [
+      {"role": "user", "content": "你好"}
+    ]
+  }'
 ```
+
+文本补全：
+
+```bash
+curl http://localhost:83/v1/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "model": "auto",
+    "prompt": "你好"
+  }'
+```
+
+`/v1/complete` 保留为兼容别名。补全接口需要真实可用账号；本地无凭据 smoke 时只能验证路由和鉴权错误，不应宣称上游调用成功。
 
 图片生成：
 
@@ -209,7 +249,19 @@ curl http://localhost:83/v1/messages \
 
 ## 4. 模型与 Provider 路由
 
-`services/models.py` 维护 `gpt` 与 `grok` 服务商模型，并通过 `ModelSpec` 描述 `capability`、`mode_id`、`model_tier`、`prefer_best` 等路由属性。`/v1/chat/completions` 保持公共入口不变，按请求 `model` 选择 provider 与账号。
+`services/providers/base.py` 定义 `gpt`、`grok`、`gemini` provider 常量和 `ModelSpec`。`services/providers/registry.py` 汇总三类 provider 的模型表，并提供 `normalize_provider`、`resolve_model`、`is_image_model`。`services/models.py` 保留为兼容 facade，旧代码仍可从这里导入常量、模型表和 helper。
+
+每个 provider 的维护边界如下：
+
+| Provider | 后端目录 | 主要职责 |
+| --- | --- | --- |
+| GPT | `services/providers/gpt/` | GPT fallback 与图片模型、GPT access token/session 账号导入导出、ChatGPT Web 文本链路、GPT 图片生成和编辑。 |
+| Grok | `services/providers/grok/` | Grok Console 与 app-chat 模型、token/cookie 账号处理、tier/capabilities 匹配、Grok 文本、图片生成和图片编辑。 |
+| Gemini | `services/providers/gemini/` | Gemini 模型、`__Secure-1PSID` cookie/session 账号处理、Gemini Web 文本链路、Gemini native API 相关能力。 |
+
+前端 provider 配置集中在 `web/src/providers/`。`registry.ts` 汇总账号页和试验页可用的 provider 定义，`gpt.ts`、`grok.ts`、`gemini.ts` 分别维护导入提示、导出按钮、刷新能力、额度展示和标签文案。新增 provider 字段时，先改对应 provider 定义，再检查 `web/src/app/accounts/` 和 `web/src/app/image/` 是否需要展示或筛选。
+
+`/v1/chat/completions` 保持公共入口不变，按请求 `model` 选择 provider 与账号。
 
 ### 4.1 模型注册分组
 
@@ -221,7 +273,7 @@ curl http://localhost:83/v1/messages \
 | Grok Console 文本 | `grok-4.3`、`grok-4`、`grok-4.20`、`grok-4.20-reasoning`、`grok-4.20-non-reasoning`、`grok-4.20-multi-agent` | 无 `mode_id`，走 Console Responses 路径。 |
 | Grok app-chat 文本 | `grok-4.20-0309` 系列、`grok-4.20-fast`、`grok-4.20-auto`、`grok-4.20-expert`、`grok-4.20-heavy`、`grok-4.3-beta` | 带 `mode_id`，走 grok.com app-chat。 |
 | Grok app-chat 图片 | `grok-imagine-image-lite`、`grok-imagine-image`、`grok-imagine-image-pro`、`grok-imagine-image-edit` | 图片生成或图片编辑，模型元数据标记 `capability`。 |
-| Grok video 声明 | `grok-imagine-video` | 只声明为未支持的视频能力，执行返回 `unsupported_model`。 |
+| Grok video 声明 | `grok-imagine-video` | 只声明为未支持的视频能力，执行返回 `unsupported_model`。Grok files 和 voice 未接入。 |
 
 当前 Grok token/cookie 无法访问 `console.x.ai` 或 `api.x.ai` 的模型列表端点，因此不做 Grok 动态模型拉取。本项目使用 Grok 网页端 token/cookie 的 provider 处理，不声明官方 xAI API Key 接入。
 
@@ -234,6 +286,7 @@ curl http://localhost:83/v1/messages \
 | Grok 无 `mode_id` 文本模型 | `grok` | Grok Console Responses | `provider=grok` 账号。 |
 | Grok 带 `mode_id` 文本模型 | `grok` | Grok app-chat | `provider=grok` 且匹配 tier/capabilities 的账号。 |
 | Grok imagine 图片模型 | `grok` | Grok app-chat | `provider=grok` 且匹配图片 capability、tier/capabilities 的账号。 |
+| Gemini 文本模型 | `gemini` | Gemini Web / native 转换路径 | `provider=gemini` 账号。 |
 
 Grok 文本聊天的非流式响应和流式请求都会返回 OpenAI 兼容结果；流式请求封装为 stream-compatible chunks，并保留可见的 `reasoning_content`。
 
@@ -262,6 +315,22 @@ GPT 图片编辑约束：
 ### 6.2 Grok app-chat
 
 带 `mode_id` 的 Grok 文本模型、Grok 图片生成和 `grok-imagine-image-edit` 图片编辑走 grok.com app-chat。app-chat 可读取账号级或 profile 级的 `cf_clearance`、`cf_cookies`、UA、client hints、Statsig 字段。
+
+#### Grok 账号生命周期与状态优先级机制
+
+在账号生命周期维护中，系统引入状态优先级（Status Precedence）决策，用于防止临时探测波动或陈旧 probe 失败导致健康账号被错误下线或禁用：
+
+1. **真实调用优先（Call Precedence Over Probe）**
+   - 24 小时内成功的真实 Grok 业务调用（具有 `last_success_at` 的有效记录）优先级最高，能够覆盖后续 Cloudflare 质询错误或 403 probe 故障。
+   - 只要账号在 24 小时内有成功调用，即使后续探针（Probe）遭遇临时 Cloudflare 或 403 故障，UI 面向用户的健康字段也会恢复并维持为正常状态。
+   - 该状态在内部通过 `last_check_status: "valid_by_call"` 表示，此时将清空 UI 面向用户的临时/瞬态故障字段（如 `state_reason`、`last_check_error` 与 `last_check_http_status`），即 `last_check_http_status` 不再保留该被覆盖的 403 状态，确保调用链路仍能继续重试或复用该账号。
+
+2. **陈旧成功转为未验证（Stale Success Expiration）**
+   - 如果成功的真实调用时间超出 24 小时（由 `GROK_RECENT_SUCCESS_TTL_SECONDS` 控制），该陈旧成功不再具备状态覆盖优先级。
+   - 此时，该账号若再次在 Probe 探测中遇到 Cloudflare 质询或 HTTP 403 错误，其状态将恢复正常评估，可能降级或转为 `unverified`（未验证）状态，并在 `state_reason` 中记录为 `cloudflare_or_forbidden`。
+
+3. **调度与退避元数据记录（Scheduling/Backoff Metadata）**
+   - 无论是否触发真实调用优先级覆盖，探针执行过程中的调度与退避控制属性仍能记录和体现相应的探测实况。例如，`last_check_at`、`last_refresh_attempt_at` 以及 `refresh_backoff_until` 仍会记录探针与刷新的执行时间及退避控制，用于协调底层的重试间隔与调度频率。
 
 app-chat 错误语义：
 
@@ -314,15 +383,15 @@ Grok 图片编辑：
 
 ## 8. 账号池、tier、quota 与状态反馈
 
-账号 `provider` 决定服务商，可取 `gpt` 或 `grok`。账号 `type` 只记录 plan、subscription 等套餐或订阅类型，不用于选择 GPT/Grok provider。
+账号 `provider` 决定服务商，可取 `gpt`、`grok` 或 `gemini`。账号 `type` 只记录 plan、subscription 等套餐或订阅类型，不用于选择 provider。
 
 账号池能力：
 
 - 保存和读取账号池数据。
 - 刷新账号状态、额度、限流状态和恢复时间。
-- 导入本地 CPA、远程 CPA、Sub2API、GPT access token 和 Grok token/cookie。
-- Grok 账号导入时设置 `provider=grok`；GPT 账号使用 `provider=gpt` 或默认值。
-- Grok 账号会归一化 `tier` / `model_tier` 为 `basic`、`super`、`heavy`，并保留账号级 `capabilities`、`app_chat`、`cf_cookies`、`user_agent` 等字段。
+- 导入本地 CPA、远程 CPA、Sub2API、GPT access token、Grok token/cookie 和 Gemini cookie/session。
+- Gemini 账号导入时设置 `provider=gemini`，凭据需包含 `__Secure-1PSID`，可包含 `__Secure-1PSIDTS`。`account_status` 里的 `psid_psidts`、`missing_psid`、`usable_gemini_session` 等值是派生诊断标签，不是 cookie 原文。
+- Grok 账号导入时设置 `provider=grok`，并会归一化 `tier` / `model_tier` 为 `basic`、`super`、`heavy`，保留账号级 `capabilities`、`app_chat`、`cf_cookies`、`user_agent` 等字段。`capabilities` 只能限制已接入用途，video、files 和 voice 仍是未支持或预留能力。
 - 通过 JSON、SQLite、PostgreSQL 或 Git 存储账号与用户密钥。
 
 Grok app-chat 账号选择：
@@ -343,10 +412,11 @@ Grok app-chat 账号选择：
 
 账号导出：
 
-- 导出按 GPT/Grok 服务商分别生成 TXT 文件。
+- 导出按 GPT/Grok/Gemini 服务商分别生成 TXT 文件。
 - GPT 文件名固定为 `webchat2api-gpt.txt`。
 - Grok 文件名固定为 `webchat2api_grok.txt`。
-- TXT 内容每行一个 `access_token` 或 `sso` 凭据，优先使用清理后的 `access_token`，缺失时使用清理后的 `sso`。
+- Gemini 文件名固定为 `webchat2api_gemini.txt`。
+- TXT 内容每行一个 `access_token`、`sso` 或 Gemini cookie/session 凭据，优先使用清理后的 `access_token`，缺失时使用清理后的 `sso`。
 - `access_tokens` 为空数组时导出指定 provider 的全部账号。
 
 账号导出示例：
@@ -493,6 +563,14 @@ Fallback 语义：
 - `config.json` 可保存本地密钥、代理、R2、WebDAV、CPA、Sub2API、远程账号和内容过滤配置。
 - 不要提交 Token、Cookie、Session、SSO、`cf_clearance`、R2 密钥或用户 API Key。
 
+本地 dev 或 smoke 测试建议使用独立容器名和 `8083:83` 映射，避免覆盖宿主机 `83` 端口上的生产容器。例如：
+
+```bash
+docker build -t webchat2api:dev .
+docker run --rm -d --name webchat2api-dev -p 8083:83 -e PORT=83 -e HOST=0.0.0.0 -e LOGIN_SECRET=admin webchat2api:dev
+curl http://localhost:8083/health
+```
+
 ## 12. Web 管理端与试验页
 
 管理后台入口：`http://localhost:83`。主要页面包括 `/`、`/accounts`、`/image`、`/image-manager`、`/logs`、`/settings` 和 `/login`。
@@ -500,9 +578,9 @@ Fallback 语义：
 管理后台能力：
 
 - 账号池列表、搜索、筛选、刷新、删除和状态编辑。
-- 账号导入：access token、本地 CPA、远程 CPA、Sub2API、Grok token/cookie 和远程账号来源。
+- 账号导入：账号导入弹窗从 `web/src/providers/` 读取 provider 文案和可用方式。GPT 支持 Access Token、Session JSON、本地 CPA、远程 CPA 与 Sub2API；Grok 支持 token/cookie、本地 CPA、远程 CPA 与 Sub2API（需要注意，前端手动与 TXT 导入仅接受裸 SSO 值或单行 `sso=<值>`，不支持分号、完整 Cookie 请求头、`sso-rw` 或其他 cookie 键值对；API 或远程注入路径拥有其各自的校验规则，用户必须遵循对应的端点 schema，不应假设前端接受完整 cookie 头部）；Gemini 支持包含 `__Secure-1PSID` 的 cookie/session、本地 CPA、远程 CPA 与 Sub2API，可附带 `__Secure-1PSIDTS`。
 - 管理后台可按服务商 `provider` 和套餐 `type` 分别筛选账号。
-- 账号导出：按 GPT/Grok 服务商分别下载 TXT。
+- 账号导出：按 GPT/Grok/Gemini 服务商分别下载 TXT，文件名为 `webchat2api-gpt.txt`、`webchat2api_grok.txt`、`webchat2api_gemini.txt`。
 - 用户 API Key 管理。
 - CPA、Sub2API 和远程账号来源配置、同步和导入。
 - 代理、基础 URL、备份、图片存储、用户密钥、CPA、Sub2API 和内容过滤等配置。
@@ -516,17 +594,17 @@ Fallback 语义：
 - 调用 `/v1/chat/completions`。
 - 聊天消息保存在浏览器本地 localforage 中，刷新页面后仍保留。
 - 错误消息会显示在聊天历史中，但不会作为下一次 API 请求上下文发送。
-- “批量测试模型”会从 `/v1/models` 获取 GPT/Grok 模型，逐个调用文本模型并显示 `pending`、`testing`、`success`、`error` 状态。
+- “批量测试模型”会从 `/v1/models` 获取当前所选 provider 的文本模型，逐个调用并显示 `pending`、`testing`、`success`、`error` 状态。
 - 提供清空文本聊天记录功能。
 
 图像试验：
 
 - 文生图调用 `/v1/images/generations`。
 - 图生图调用 `/v1/images/edits`。
-- GPT 图片仍走 GPT 图片账号池。
+- 图片 provider 选择器会按 `provider` 和模型 `capability` 过滤模型。GPT 可用于 GPT 图片生成和编辑，Grok 可用于 Grok imagine 生成和编辑，Gemini 目前没有可用图片模型时会显示不可用提示。
 - Grok 文生图可使用 `grok-imagine-image-lite`、`grok-imagine-image`、`grok-imagine-image-pro`。
 - Grok 图生图可使用 `grok-imagine-image-edit`，限制为 `1024x1024`、最多 7 张参考图、`n<=2`。
-- `grok-imagine-video` 当前返回不支持。
+- `grok-imagine-video` 当前返回不支持。Grok files 和 voice 也未接入。
 - 图片任务保留队列和历史记录。
 - 遇到失效账号时，后端会在同次任务中排除该账号并尝试下一个可用账号，直到成功或账号池耗尽。
 
@@ -649,6 +727,44 @@ docker run -d \
 ## 14. 测试、排障与安全建议
 
 ### 14.1 测试与检查
+
+#### 14.1.1 针对性 Grok/账号测试 (Release Validation)
+发布前或开发调试中，可以运行针对性的单体/集成测试以校验状态优先级及账号生命周期逻辑：
+
+```bash
+# 运行账号 Provider 专项测试，重点覆盖 Gemini 与 Grok 账号生命周期状态和优先级判断
+python3 -m unittest test/test_account_provider.py
+```
+
+该测试套件无需任何真实上游 API 凭据或环境机密，仅使用内存 Mock 验证以下逻辑：
+- 24 小时内有成功记录的 Grok 账号在 Probe 质询故障时仍能保持 `valid_by_call` / `正常` 状态。
+- 超过 24 小时（`GROK_RECENT_SUCCESS_TTL_SECONDS` 之后）的成功调用不再生效，Probe 403 会正确引发状态下降。
+
+#### 14.1.2 容器与部署验证 (Container Verification)
+如需验证 Docker 构建和多容器配合情况，但在本地没有设置 Grok 账号凭据或 CF Clearance 等敏感信息：
+1. 构建本地 dev 镜像：
+   ```bash
+   docker build -t webchat2api:dev .
+   ```
+2. 启动一个独立的临时容器用于 smoke 测试，避免占用宿主机生产端口 `83`：
+   ```bash
+   docker run --rm -d --name webchat2api-smoke -p 8083:83 -e PORT=83 -e HOST=0.0.0.0 -e LOGIN_SECRET=admin webchat2api:dev
+   ```
+3. 验证基础 API 接口可用性：
+   ```bash
+   # 检查健康接口
+   curl http://localhost:8083/health
+   # 检查版本接口
+   curl http://localhost:8083/version
+   ```
+4. 进入容器内验证 Browser Bridge 服务的独立健康状态（容器内部默认监听 `3080`）：
+   ```bash
+   docker exec -it webchat2api-smoke curl http://127.0.0.1:3080/health
+   ```
+5. 完成测试后清理容器：
+   ```bash
+   docker stop webchat2api-smoke
+   ```
 
 后端单元测试：
 
